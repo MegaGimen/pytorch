@@ -2878,6 +2878,17 @@ class TestMaxAutotune(TestCase):
                     "triton.decompose_k_threshold": decompose_k_threshold,
                 }
             ):
+                device_properties = DeviceProperties.create(torch.device(GPU_TYPE))
+                output_ctas = 2 * ((M + 63) // 64) * ((N + 63) // 64)
+                min_k_split = (
+                    device_properties.multi_processor_count + output_ctas - 1
+                ) // output_ctas
+                expected_splits = get_k_splits(
+                    M,
+                    N,
+                    K,
+                    min_k_split=min_k_split,
+                )
                 compiled_func = torch.compile(lambda a, b: a @ b)
                 _, code = run_and_get_code(compiled_func, a, b)
 
@@ -2895,6 +2906,31 @@ class TestMaxAutotune(TestCase):
                 else:
                     self.assertTrue(decompose_count > 0)
                     self.assertTrue(decompose_count <= num_decompose_k_splits)
+
+    @config.patch(
+        {
+            "triton.num_decompose_k_splits": 10,
+            "max_autotune_gemm_search_space": "DEFAULT",
+        }
+    )
+    def test_decompose_k_filters_underfilled_splits(self):
+        get_k_splits.cache_clear()
+        with config.patch(max_autotune_gemm_search_space="EXHAUSTIVE"):
+            all_splits = get_k_splits(80, 72, 1_343_232)
+
+        get_k_splits.cache_clear()
+        candidates = get_k_splits(80, 72, 1_343_232, min_k_split=19)
+        self.assertEqual(candidates, [s for s in all_splits if s >= 19][:10])
+        self.assertIn(72, candidates)
+
+        get_k_splits.cache_clear()
+        self.assertEqual(get_k_splits(64, 64, 5248, min_k_split=74), [])
+
+        get_k_splits.cache_clear()
+        self.assertEqual(get_k_splits(256, 128, 11_091_857, min_k_split=10), [])
+
+        get_k_splits.cache_clear()
+        self.assertIn(587, get_k_splits(256, 128, 10_954_007, min_k_split=10))
 
     @unittest.skipIf(
         config.triton.native_matmul,
