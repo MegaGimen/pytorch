@@ -239,6 +239,42 @@ class PipelineStageMetadataTest(TestCase):
             stage.forward_one_chunk(0, (torch.ones(1),))
             self.assertEqual(module.kwargs, {})
 
+    def test_recv_metadata_reinit_rejects_owned_buffers(self):
+        with single_rank_process_group():
+            activation = torch.ones(1, requires_grad=True)
+            forward_stage = PipelineStage(
+                torch.nn.Identity(),
+                stage_index=1,
+                num_stages=2,
+                device=torch.device("cpu"),
+                input_args=activation,
+                output_args=activation,
+            )
+            forward_stage._inference_mode = InferenceMode.STATIC
+            forward_stage._prepare_forward_infra(1, None)
+            forward_stage.args_recv_info[0][0].allocate_buffer("cpu")
+            with self.assertRaisesRegex(
+                PipeliningMetadataError, "incomplete pipeline step"
+            ):
+                forward_stage._prepare_forward_infra(1, None)
+
+            backward_stage = PipelineStage(
+                torch.nn.Identity(),
+                stage_index=0,
+                num_stages=2,
+                device=torch.device("cpu"),
+                input_args=activation,
+                output_args=activation,
+            )
+            backward_stage._inference_mode = InferenceMode.STATIC
+            backward_stage._prepare_forward_infra(1, (activation,))
+            backward_stage._prepare_backward_infra(1)
+            backward_stage.grad_recv_info[0][0].allocate_buffer("cpu")
+            with self.assertRaisesRegex(
+                PipeliningMetadataError, "incomplete pipeline step"
+            ):
+                backward_stage._prepare_backward_infra(1)
+
     def test_dynamic_metadata_inference_restores_module_buffers(self):
         class BufferMutatingModule(torch.nn.Module):
             def __init__(self) -> None:
