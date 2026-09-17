@@ -26,6 +26,7 @@ from ._utils import (
     generate_rank_to_stage_mapping,
     generate_stage_to_rank_mapping,
     InferenceMode,
+    PipeliningMetadataError,
 )
 from .microbatch import (
     _split_tensor,
@@ -394,23 +395,35 @@ class _PipelineSchedule(ABC):
                 )
                 return
             acc: torch.Tensor | None = None
-            for stage in cast(list[PipelineStage], stages):
+            for stage in pp_stages:
                 acc = stage._warmup_forward_vote(has_backward, received_acc=acc)
             result: torch.Tensor | None = acc
-            determined_mode: InferenceMode | None = None
-            for stage in reversed(cast(list[PipelineStage], stages)):
+            for stage in reversed(pp_stages):
                 result = stage._warmup_backward_result(received_result=result)
-                if result is None:
-                    raise RuntimeError("P2P warm-up voting failed")
-                determined_mode = (
-                    InferenceMode.STATIC
-                    if result.item() == 1
-                    else InferenceMode.DYNAMIC
+            if result is None:
+                raise RuntimeError("P2P warm-up voting failed")
+            supports_static, permits_dynamic = map(bool, result.tolist())
+            if not supports_static and not permits_dynamic:
+                local_status = ", ".join(
+                    f"stage {stage.stage_index}: "
+                    f"needs_dynamic={InferenceMode.needs_dynamic(stage._user_meta, has_backward)}, "
+                    f"pass_pipeline_metadata={stage._pass_pipeline_metadata}"
+                    for stage in pp_stages
                 )
+                raise PipeliningMetadataError(
+                    "pass_pipeline_metadata requires complete static metadata "
+                    "across the pipeline: provide input_args and output_args for "
+                    "every stage, plus input_grads and output_grads for DTensors "
+                    f"with backward. Local stage status: {local_status}"
+                )
+            determined_mode = (
+                InferenceMode.STATIC if supports_static else InferenceMode.DYNAMIC
+            )
+            for stage in pp_stages:
                 stage._inference_mode = determined_mode
             logger.debug(
                 "Rank determined inference_mode=%s for %d stage(s)",
-                determined_mode.value if determined_mode else "None",
+                determined_mode.value,
                 len(stages),
             )
         elif not p2p_done:
