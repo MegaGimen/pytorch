@@ -1055,12 +1055,6 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         ):
             self.assertFalse(precompile_package._is_library_module(name))
 
-    @parametrize("name", _LIBRARY_NAMES)
-    def test_library_module_keeps_the_waiver_for_the_real_library(self, name):
-        self.assertTrue(
-            precompile_package._is_library_module(name), f"{name} lost its waiver"
-        )
-
     def test_library_module_needs_location_evidence_only_at_the_top(self):
         is_library = precompile_package._is_library_module
         self.addCleanup(precompile_package._classify_file.cache_clear)
@@ -1101,6 +1095,33 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         # waiver with no location evidence behind it, recorded here as chosen.
         with mock.patch.object(precompile_package, "_torch_roots", return_value=()):
             self.assertTrue(is_library("torch.never_imported"))
+
+    def test_normalize_scrubs_addresses_and_counters_but_not_user_constants(self):
+        # Both directions matter: anything run-varying that survives makes the
+        # committed report churn, and anything meaningful that is erased makes
+        # two variants guarding different values render one fact.
+        from torch._dynamo.precompile_package import _normalize
+
+        cases = {
+            "___check_obj_id(G['fn'], 140311678493200), type=<class 'function'>": "___check_obj_id(G['fn'], <id>), type=<class 'function'>",
+            "G['__builtins_dict___6']['len']": "G['__builtins_dict___<n>']['len']",
+            "G['__import_mod_140311678493200_c1']": "G['__import_mod_<id>_c<n>']",
+            "G['___unnamed_scope_140311678493200_c1']": "G['___unnamed_scope_<id>_c<n>']",
+            "G['_140311678493200_c3'] is not None": "G['_<id>_c<n>'] is not None",
+            "top_saved_tensors_hooks ids == (139, 140)": "top_saved_tensors_hooks ids == (<ids>)",
+            # User constants and identifiers are not addresses.
+            "L['dims'][0] == 140311678493200": "L['dims'][0] == 140311678493200",
+            "L['w_1_c2'] == 3": "L['w_1_c2'] == 3",
+            "len(L['xs']) == 6": "len(L['xs']) == 6",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(_normalize(text), expected, text)
+
+    @parametrize("name", _LIBRARY_NAMES)
+    def test_library_module_keeps_the_waiver_for_the_real_library(self, name):
+        self.assertTrue(
+            precompile_package._is_library_module(name), f"{name} lost its waiver"
+        )
 
     def test_reads_a_builtin_keys_on_where_the_read_comes_from(self):
         reads_a_builtin = precompile_package._reads_a_builtin
@@ -1259,39 +1280,6 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         fake = types.SimpleNamespace(__qualname__="_user_op", __code__="not code")
         self.assertFalse(defined_where_read(fake, "_user_op", _HERE))
 
-    def test_defined_where_read_refuses_a_pseudo_filename(self):
-        defined_where_read = precompile_package._defined_where_read
-
-        # A co_filename is not always a path: an exec-generated frame records
-        # <string>, which realpath would resolve against the cwd, so it would
-        # compare equal to the <string> a fields-only dataclass compiles
-        # __init__ in and waive the one class the lint must report. Only
-        # absolute filenames compare; a relative one, spelled so that it does
-        # resolve to this file from the cwd, and an embedded NUL on either side
-        # fail closed instead of raising.
-        @dataclasses.dataclass
-        class Cfg:
-            x: int
-
-        pseudo = _stack("<string>")
-        self.assertEqual(Cfg.__init__.__code__.co_filename, "<string>")
-        self.assertFalse(defined_where_read(Cfg, Cfg.__qualname__, pseudo))
-        exec_ns = {}
-        exec(compile("def op(x):\n    return x\n", "<string>", "exec"), exec_ns)
-        self.assertFalse(defined_where_read(exec_ns["op"], "op", pseudo))
-        relative = os.path.relpath(__file__)
-        self.assertTrue(os.path.samefile(relative, __file__))
-        stack = _stack(relative)
-        self.assertFalse(defined_where_read(_user_op, "_user_op", stack))
-        code = _user_op.__code__.replace(co_filename=relative)
-        relative_op = types.FunctionType(code, globals(), "_user_op")
-        self.assertFalse(defined_where_read(relative_op, "_user_op", _HERE))
-        stack = _stack(__file__ + "\x00")
-        self.assertFalse(defined_where_read(_user_op, "_user_op", stack))
-        code = _user_op.__code__.replace(co_filename=__file__ + "\x00")
-        nul_op = types.FunctionType(code, globals(), "_user_op")
-        self.assertFalse(defined_where_read(nul_op, "_user_op", _HERE))
-
     def test_defined_where_read_judges_a_class_by_its_own_methods(self):
         defined_where_read = precompile_package._defined_where_read
         # A class has no code object; its methods tell. A class statement
@@ -1449,6 +1437,39 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         for key in ("__annotate__", "__annotate_func__"):
             own_key = minted(key, f"Cfg.{key}")
             self.assertFalse(defined_where_read(own_key, "Cfg", _HERE), key)
+
+    def test_defined_where_read_refuses_a_pseudo_filename(self):
+        defined_where_read = precompile_package._defined_where_read
+
+        # A co_filename is not always a path: an exec-generated frame records
+        # <string>, which realpath would resolve against the cwd, so it would
+        # compare equal to the <string> a fields-only dataclass compiles
+        # __init__ in and waive the one class the lint must report. Only
+        # absolute filenames compare; a relative one, spelled so that it does
+        # resolve to this file from the cwd, and an embedded NUL on either side
+        # fail closed instead of raising.
+        @dataclasses.dataclass
+        class Cfg:
+            x: int
+
+        pseudo = _stack("<string>")
+        self.assertEqual(Cfg.__init__.__code__.co_filename, "<string>")
+        self.assertFalse(defined_where_read(Cfg, Cfg.__qualname__, pseudo))
+        exec_ns = {}
+        exec(compile("def op(x):\n    return x\n", "<string>", "exec"), exec_ns)
+        self.assertFalse(defined_where_read(exec_ns["op"], "op", pseudo))
+        relative = os.path.relpath(__file__)
+        self.assertTrue(os.path.samefile(relative, __file__))
+        stack = _stack(relative)
+        self.assertFalse(defined_where_read(_user_op, "_user_op", stack))
+        code = _user_op.__code__.replace(co_filename=relative)
+        relative_op = types.FunctionType(code, globals(), "_user_op")
+        self.assertFalse(defined_where_read(relative_op, "_user_op", _HERE))
+        stack = _stack(__file__ + "\x00")
+        self.assertFalse(defined_where_read(_user_op, "_user_op", stack))
+        code = _user_op.__code__.replace(co_filename=__file__ + "\x00")
+        nul_op = types.FunctionType(code, globals(), "_user_op")
+        self.assertFalse(defined_where_read(nul_op, "_user_op", _HERE))
 
     @torch._dynamo.config.patch(nested_graph_breaks=True)
     def test_minted_global_names_match_dynamo(self):
@@ -1612,86 +1633,6 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
             self.assertEqual(len(risky), 1, verdicts)
             self.assertTrue(risky[0].startswith(root), verdicts)
 
-    def test_guard_policy_classification_is_total(self):
-        # A guard type in no set is KEPT, so a drop policy can only ever
-        # drop what _INVARIANT_DROPPABLE_GUARD_TYPES names. This test is
-        # what makes the never-drop claim enforceable:
-        # a guard type added to GuardBuilder fails here until someone triages
-        # it into exactly one of the four sets.
-        from torch._dynamo.guards import GuardBuilder
-        from torch._dynamo.precompile_package import (
-            _IDENTITY_GUARD_TYPES,
-            _INVARIANT_DROPPABLE_GUARD_TYPES,
-            _NOOP_GUARD_TYPES,
-            _SHAPE_BEARING_GUARD_TYPES,
-            _UNMODELLED_GUARD_TYPES,
-        )
-
-        # dir() rather than vars(): a guard method added on GuardBuilderBase or
-        # a future mixin is a GuardBuilder guard type too.
-        guard_types = {
-            name
-            for name in dir(GuardBuilder)
-            if name.isupper() and callable(getattr(GuardBuilder, name))
-        }
-        sets = {
-            "_SHAPE_BEARING_GUARD_TYPES": _SHAPE_BEARING_GUARD_TYPES,
-            "_UNMODELLED_GUARD_TYPES": _UNMODELLED_GUARD_TYPES,
-            "_INVARIANT_DROPPABLE_GUARD_TYPES": _INVARIANT_DROPPABLE_GUARD_TYPES,
-            "_NOOP_GUARD_TYPES": _NOOP_GUARD_TYPES,
-        }
-        classified: frozenset[str] = frozenset().union(*sets.values())
-        self.assertEqual(
-            sorted(guard_types - classified),
-            [],
-            "unclassified GuardBuilder guard type(s): add each to exactly one "
-            "policy set in torch/_dynamo/precompile_package.py (KEPT until then)",
-        )
-        self.assertEqual(
-            sorted(classified - guard_types),
-            [],
-            "phantom entries: no GuardBuilder method by these names",
-        )
-        for (a_name, a), (b_name, b) in itertools.combinations(sets.items(), 2):
-            self.assertEqual(sorted(a & b), [], f"{a_name} overlaps {b_name}")
-        # The identity guards the default filter drops are droppable by
-        # construction; a literal rewrite of the set must not lose that.
-        self.assertTrue(_IDENTITY_GUARD_TYPES <= _INVARIANT_DROPPABLE_GUARD_TYPES)
-
-    def test_noop_guard_type_follows_the_hook_guard_config(self):
-        # EMPTY_NN_MODULE_HOOKS_DICT emits nothing under the default config and
-        # a SEQUENCE_LENGTH on the hook dicts otherwise, so whether a report may
-        # treat it as a marker depends on the config the frame compiled under.
-        from torch._dynamo.precompile_package import _is_noop_guard_type
-
-        self.assertTrue(_is_noop_guard_type("GRAD_MODE"))
-        self.assertFalse(_is_noop_guard_type("TENSOR_MATCH"))
-        self.assertTrue(_is_noop_guard_type("EMPTY_NN_MODULE_HOOKS_DICT"))
-        with torch._dynamo.config.patch(skip_nnmodule_hook_guards=False):
-            self.assertFalse(_is_noop_guard_type("EMPTY_NN_MODULE_HOOKS_DICT"))
-            self.assertTrue(_is_noop_guard_type("GRAD_MODE"))
-
-    def test_normalize_scrubs_addresses_and_counters_but_not_user_constants(self):
-        # Both directions matter: anything run-varying that survives makes the
-        # committed report churn, and anything meaningful that is erased makes
-        # two variants guarding different values render one fact.
-        from torch._dynamo.precompile_package import _normalize
-
-        cases = {
-            "___check_obj_id(G['fn'], 140311678493200), type=<class 'function'>": "___check_obj_id(G['fn'], <id>), type=<class 'function'>",
-            "G['__builtins_dict___6']['len']": "G['__builtins_dict___<n>']['len']",
-            "G['__import_mod_140311678493200_c1']": "G['__import_mod_<id>_c<n>']",
-            "G['___unnamed_scope_140311678493200_c1']": "G['___unnamed_scope_<id>_c<n>']",
-            "G['_140311678493200_c3'] is not None": "G['_<id>_c<n>'] is not None",
-            "top_saved_tensors_hooks ids == (139, 140)": "top_saved_tensors_hooks ids == (<ids>)",
-            # User constants and identifiers are not addresses.
-            "L['dims'][0] == 140311678493200": "L['dims'][0] == 140311678493200",
-            "L['w_1_c2'] == 3": "L['w_1_c2'] == 3",
-            "len(L['xs']) == 6": "len(L['xs']) == 6",
-        }
-        for text, expected in cases.items():
-            self.assertEqual(_normalize(text), expected, text)
-
     def test_code_fingerprint_recurses_into_container_and_nested_consts(self):
         # _code_fingerprint names a callable by its body so an ACT2FN-style table
         # can be told apart. Two lambdas can differ ONLY inside a constant the
@@ -1771,6 +1712,65 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         self.assertEqual(len(rendered), 160)
         self.assertTrue(rendered.startswith(prefix), rendered)
         self.assertNotIn("#", rendered[len(prefix) :])
+
+    def test_guard_policy_classification_is_total(self):
+        # A guard type in no set is KEPT, so a drop policy can only ever
+        # drop what _INVARIANT_DROPPABLE_GUARD_TYPES names. This test is
+        # what makes the never-drop claim enforceable:
+        # a guard type added to GuardBuilder fails here until someone triages
+        # it into exactly one of the four sets.
+        from torch._dynamo.guards import GuardBuilder
+        from torch._dynamo.precompile_package import (
+            _IDENTITY_GUARD_TYPES,
+            _INVARIANT_DROPPABLE_GUARD_TYPES,
+            _NOOP_GUARD_TYPES,
+            _SHAPE_BEARING_GUARD_TYPES,
+            _UNMODELLED_GUARD_TYPES,
+        )
+
+        # dir() rather than vars(): a guard method added on GuardBuilderBase or
+        # a future mixin is a GuardBuilder guard type too.
+        guard_types = {
+            name
+            for name in dir(GuardBuilder)
+            if name.isupper() and callable(getattr(GuardBuilder, name))
+        }
+        sets = {
+            "_SHAPE_BEARING_GUARD_TYPES": _SHAPE_BEARING_GUARD_TYPES,
+            "_UNMODELLED_GUARD_TYPES": _UNMODELLED_GUARD_TYPES,
+            "_INVARIANT_DROPPABLE_GUARD_TYPES": _INVARIANT_DROPPABLE_GUARD_TYPES,
+            "_NOOP_GUARD_TYPES": _NOOP_GUARD_TYPES,
+        }
+        classified: frozenset[str] = frozenset().union(*sets.values())
+        self.assertEqual(
+            sorted(guard_types - classified),
+            [],
+            "unclassified GuardBuilder guard type(s): add each to exactly one "
+            "policy set in torch/_dynamo/precompile_package.py (KEPT until then)",
+        )
+        self.assertEqual(
+            sorted(classified - guard_types),
+            [],
+            "phantom entries: no GuardBuilder method by these names",
+        )
+        for (a_name, a), (b_name, b) in itertools.combinations(sets.items(), 2):
+            self.assertEqual(sorted(a & b), [], f"{a_name} overlaps {b_name}")
+        # The identity guards the default filter drops are droppable by
+        # construction; a literal rewrite of the set must not lose that.
+        self.assertTrue(_IDENTITY_GUARD_TYPES <= _INVARIANT_DROPPABLE_GUARD_TYPES)
+
+    def test_noop_guard_type_follows_the_hook_guard_config(self):
+        # EMPTY_NN_MODULE_HOOKS_DICT emits nothing under the default config and
+        # a SEQUENCE_LENGTH on the hook dicts otherwise, so whether a report may
+        # treat it as a marker depends on the config the frame compiled under.
+        from torch._dynamo.precompile_package import _is_noop_guard_type
+
+        self.assertTrue(_is_noop_guard_type("GRAD_MODE"))
+        self.assertFalse(_is_noop_guard_type("TENSOR_MATCH"))
+        self.assertTrue(_is_noop_guard_type("EMPTY_NN_MODULE_HOOKS_DICT"))
+        with torch._dynamo.config.patch(skip_nnmodule_hook_guards=False):
+            self.assertFalse(_is_noop_guard_type("EMPTY_NN_MODULE_HOOKS_DICT"))
+            self.assertTrue(_is_noop_guard_type("GRAD_MODE"))
 
     def test_value_fingerprint_dispatches_on_the_guard_type(self):
         from torch.compiler._precompile_types import GuardFact
@@ -2110,6 +2110,29 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
                 with _capture_config(training=False):
                     self.assertTrue(functorch_config.strict_autograd_cache)
             self.assertFalse(functorch_config.strict_autograd_cache)
+
+    def test_allow_empty_graphs_convert_frame_patches_around_the_compile(self):
+        from torch._dynamo.convert_frame import ConvertFrame
+        from torch._dynamo.hooks import Hooks
+        from torch._dynamo.precompile_package import _AllowEmptyGraphsConvertFrame
+
+        seen = []
+
+        def fake_convert(self, frame, cache_entry, hooks, frame_state, skip=0):
+            seen.append((torch._dynamo.config.allow_empty_graphs, skip))
+            raise RuntimeError("boom")
+
+        converter = _AllowEmptyGraphsConvertFrame(lambda gm, inputs: gm, Hooks())
+        with (
+            torch._dynamo.config.patch(allow_empty_graphs=False),
+            mock.patch.object(ConvertFrame, "__call__", fake_convert),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                converter(sys._getframe(), None, Hooks(), {}, skip=1)
+            self.assertFalse(torch._dynamo.config.allow_empty_graphs)
+        # The flag was on for the compile and the extra frame is accounted for
+        # in the traceback skip count.
+        self.assertEqual(seen, [(True, 2)])
 
 
 instantiate_parametrized_tests(TestPrecompilePackage)
