@@ -35,19 +35,17 @@ def main() -> None:
         "--dst",
         type=Path,
         default=None,
-        help="installed torch package dir (default: import torch)",
+        help="installed torch package dir (default: this venv's site-packages/torch)",
     )
     args = parser.parse_args()
     src_root = args.src.resolve()
     if args.dst is None:
-        import torch
+        import sysconfig
 
-        dst_root = Path(torch.__file__).resolve().parent
+        dst_root = Path(sysconfig.get_path("purelib")) / "torch"
     else:
         dst_root = args.dst.resolve()
-        if dst_root.name == "torch":
-            pass
-        else:
+        if dst_root.name != "torch":
             dst_root = dst_root / "torch"
 
     print(f"overlay {src_root} -> {dst_root}", flush=True)

@@ -20,6 +20,8 @@ os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
 os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:32,garbage_collection_threshold:0.6")
+# Source checkout of pytorch must not shadow the installed 2.13.0 wheel.
+sys.path = [p for p in sys.path if "torch-work/pytorch" not in p.replace("\\", "/")]
 
 MEM_CAP_MIB = 500
 

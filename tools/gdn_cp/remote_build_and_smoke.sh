@@ -61,5 +61,6 @@ echo "[gdn] nvidia-smi before smoke"
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader || true
 
 echo "[gdn] launching 2-GPU FSDP+CP smoke, ${MEM_CAP_MIB} MiB/GPU cap"
-cd "${SRC}"
-torchrun --standalone --nproc_per_node=2 tools/gdn_cp/smoke_fsdp_cp.py
+# Do not cwd into the pytorch source tree: that shadows the installed torch.
+cd "${ROOT}"
+torchrun --standalone --nproc_per_node=2 "${SRC}/tools/gdn_cp/smoke_fsdp_cp.py"
