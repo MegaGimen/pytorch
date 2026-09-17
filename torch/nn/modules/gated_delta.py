@@ -1,13 +1,24 @@
 # Minimal Gated DeltaNet module. Weights are tiny on purpose so a 2-GPU
 # FSDP+CP smoke can stay under a 500 MiB per-process CUDA cap.
+#
+# Do not `import torch.nn` here: this file is imported from
+# torch.nn.modules.__init__ while the nn package is still loading.
 from __future__ import annotations
 
 import torch
-from torch import Tensor, nn
-from torch.nn.attention import gated_delta as _gdn_ops
+from torch import Tensor
+from torch.nn.parameter import Parameter
+
+from .container import ModuleList
+from .conv import Conv1d
+from .linear import Linear
+from .module import Module
+from .normalization import RMSNorm
+from .sparse import Embedding
+from .. import init as init
 
 
-class GatedDeltaNet(nn.Module):
+class GatedDeltaNet(Module):
     """One GDN block: fused in-proj → gated delta rule → out-proj.
 
     Layout is ``[B, T, H, D]`` after the input projection is split into heads.
@@ -39,9 +50,9 @@ class GatedDeltaNet(nn.Module):
         self.v_dim = num_heads * self.head_v_dim
         # q, k, v, z-gate, beta
         in_features = self.qk_dim * 2 + self.v_dim * 2 + num_heads
-        self.in_proj = nn.Linear(hidden_size, in_features, bias=bias, **factory)
-        self.out_proj = nn.Linear(self.v_dim, hidden_size, bias=bias, **factory)
-        self.conv1d = nn.Conv1d(
+        self.in_proj = Linear(hidden_size, in_features, bias=bias, **factory)
+        self.out_proj = Linear(self.v_dim, hidden_size, bias=bias, **factory)
+        self.conv1d = Conv1d(
             self.qk_dim + self.qk_dim + self.v_dim,
             self.qk_dim + self.qk_dim + self.v_dim,
             kernel_size=conv_kernel_size,
@@ -50,13 +61,15 @@ class GatedDeltaNet(nn.Module):
             bias=False,
             **factory,
         )
-        self.A_log = nn.Parameter(
+        self.A_log = Parameter(
             torch.log(torch.empty(num_heads, **factory).uniform_(1.0, 16.0))
         )
-        self.dt_bias = nn.Parameter(torch.zeros(num_heads, **factory))
+        self.dt_bias = Parameter(torch.zeros(num_heads, **factory))
 
     def forward(self, hidden_states: Tensor) -> Tensor:
-        # hidden_states: [B, T, C]
+        from torch.nn import functional as F
+        from torch.nn.attention import gated_delta as gdn_ops
+
         batch, seq_len, _ = hidden_states.shape
         projected = self.in_proj(hidden_states)
         qk = self.qk_dim
@@ -69,28 +82,23 @@ class GatedDeltaNet(nn.Module):
         qkv = torch.cat([q_lin, k_lin, v_lin], dim=-1)
         qkv = qkv.transpose(1, 2)
         qkv = self.conv1d(qkv)[..., :seq_len]
-        qkv = torch.nn.functional.silu(qkv).transpose(1, 2)
+        qkv = F.silu(qkv).transpose(1, 2)
         q_lin, k_lin, v_lin = torch.split(qkv, [qk, qk, vd], dim=-1)
 
         q = q_lin.unflatten(-1, (self.num_heads, self.head_k_dim))
         k = k_lin.unflatten(-1, (self.num_heads, self.head_k_dim))
         v = v_lin.unflatten(-1, (self.num_heads, self.head_v_dim))
         beta = torch.sigmoid(beta_lin)
-        # decay = -exp(A_log) * softplus(dt_bias + 0)  — per-token beta already
-        # carries the write; A_log is a per-head log-decay, broadcast over T.
-        decay = -self.A_log.exp() * torch.nn.functional.softplus(
-            self.dt_bias
-        )
+        decay = -self.A_log.exp() * F.softplus(self.dt_bias)
         decay = decay.view(1, 1, self.num_heads).expand(batch, seq_len, self.num_heads)
 
-        core = _gdn_ops.gated_delta_rule(q, k, v, decay, beta)
+        core = gdn_ops.gated_delta_rule(q, k, v, decay, beta)
         core = core.flatten(-2)
-        # z-gate on the value channel, same as GDN's output gate.
-        z = torch.nn.functional.silu(z_lin)
+        z = F.silu(z_lin)
         return self.out_proj(core * z)
 
 
-class TinyGatedDeltaModel(nn.Module):
+class TinyGatedDeltaModel(Module):
     """Stack of GDN blocks plus an embedding, for FSDP+CP smoke tests."""
 
     def __init__(
@@ -105,8 +113,8 @@ class TinyGatedDeltaModel(nn.Module):
     ) -> None:
         super().__init__()
         factory = {"device": device, "dtype": dtype}
-        self.embed = nn.Embedding(vocab_size, hidden_size, **factory)
-        self.layers = nn.ModuleList(
+        self.embed = Embedding(vocab_size, hidden_size, **factory)
+        self.layers = ModuleList(
             [
                 GatedDeltaNet(
                     hidden_size,
@@ -118,18 +126,18 @@ class TinyGatedDeltaModel(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.norm = nn.RMSNorm(hidden_size, **factory)
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False, **factory)
+        self.norm = RMSNorm(hidden_size, **factory)
+        self.lm_head = Linear(hidden_size, vocab_size, bias=False, **factory)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if isinstance(module, Linear):
+                init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                    init.zeros_(module.bias)
+            elif isinstance(module, Embedding):
+                init.normal_(module.weight, mean=0.0, std=0.02)
 
     def n_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
