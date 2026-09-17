@@ -97,7 +97,7 @@ IMPLEMENT_VML(trunc)
 IMPLEMENT_VML(lgamma)
 
 
-#if AT_MKL_ENABLED() && !defined(__APPLE__)
+#if AT_MKL_ENABLED() && !defined(__APPLE__) && !defined(AT_VEC_CUSTOM_MATH)
 
 // NB: LP64 MKL is the most commonly used and thus we assume it here. That means
 // we need to expect MKL_INT to be of type int, which implies int32_t or int64_t in most
