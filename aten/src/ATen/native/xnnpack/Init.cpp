@@ -5,6 +5,20 @@
 
 namespace at::native::xnnpack {
 namespace internal {
+
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+TORCH_API void register_backend();
+
+} // namespace internal
+namespace {
+
+[[maybe_unused]] const bool backend_registered_ = []() {
+  internal::register_backend();
+  return true;
+}();
+
+} // namespace
+namespace internal {
 namespace {
 
 bool is_initialized_ = false;
