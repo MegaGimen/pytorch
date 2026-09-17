@@ -33,7 +33,7 @@ if [[ ! -x "${VENV}/bin/python" ]]; then
 fi
 # shellcheck disable=SC1091
 source "${VENV}/bin/activate"
-python -m pip install -U pip setuptools wheel ninja
+python -m pip install -U pip setuptools wheel ninja numpy
 
 if ! python -c "import torch; assert torch.__version__.startswith('2.13.0')" 2>/dev/null; then
   echo "[gdn] installing torch==2.13.0 into isolated venv"
