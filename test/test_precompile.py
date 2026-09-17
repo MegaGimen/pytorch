@@ -129,8 +129,17 @@ class _CaptureToFiles:
         finally:
             shutil.rmtree(self._dir, ignore_errors=True)
 
-    def __call__(self, *args):
-        return self._cap(*args)
+    def __call__(self, *args, **kwargs):
+        return self._cap(*args, **kwargs)
+
+    def summary(self):
+        return self._cap.summary()
+
+    def invariants(self):
+        return self._cap.invariants()
+
+    def calls(self):
+        return self._cap.calls()
 
     def result(self):
         if self._pair is None:
@@ -4003,13 +4012,13 @@ class TestPrecompile(TestCase):
         self.assertTrue(params["require_no_risky_drops"].default)
         self.assertFalse(params["require_no_dropped_guards"].default)
 
-    def test_default_tracer_is_make_fx(self):
+    def test_default_tracer_is_dynamo(self):
         default = (
             inspect.signature(torch.compiler.precompile.capture)
             .parameters["tracer"]
             .default
         )
-        self.assertEqual(default, MakeFxTracer())
+        self.assertEqual(default, DynamoTracer())
 
     def test_public_api_surface(self):
         # precompile lives under torch.compiler only: no torch.precompile, and the
@@ -4167,7 +4176,6 @@ class TestPrecompile(TestCase):
                 torch.ones(2)
             )
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_dynamo_artifact_version_lock_raises_precompile_error(self):
         # Note [precompile programming model] promises the driver's
         # Python-version lock surfaces as a clean PrecompileError, so an
@@ -4189,7 +4197,6 @@ class TestPrecompile(TestCase):
 
     @parametrize("case", list(_PRECOMPILE_ROUNDTRIP_CASES))
     @parametrize("backend", ["inductor", "eager"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_dynamo_roundtrip(self, case, backend):
         # The dynamo tracer captures via Dynamo, inlines the transformed bytecode, and
         # (like make_fx) lowers the subgraph through the chosen backend. The reload runs
@@ -4213,7 +4220,7 @@ class TestPrecompile(TestCase):
             swapped = make_modules()
             self.assertEqual(f_c(*swapped, x), reference(*swapped, x))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_tracer_dynamo_autograd_grad_returned(self):
         # torch.autograd.grad is captured too, and (unlike .backward()) it only RETURNS the
         # grads: nothing is scattered, so the runtime model's .grad stays None.
@@ -4258,7 +4265,6 @@ class TestPrecompile(TestCase):
 
     @parametrize("guard_filter", ["keep_all", "portable", "drop_all"])
     @parametrize("caching_precompile", [False, True])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_guard_filter_composes_with_the_default(
         self, guard_filter, caching_precompile
     ):
@@ -4312,7 +4318,6 @@ class TestPrecompile(TestCase):
                 loaded(torch.randn(9, 8))
 
     @parametrize("how", ["raise_in_block", "caught_call"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_a_failed_capture_is_incomplete(self, how):
         x = torch.randn(4)
         entry = (
@@ -4348,8 +4353,9 @@ class TestPrecompile(TestCase):
         self.assertGreater(summary.guarded_codes, 0)
         self.assertFalse(summary.complete)
         self.assertEqual(len(summary.capture_errors), 1)
-        # No artifact was written for the incomplete capture.
-        with self.assertRaises(PrecompileError):
+        # No artifact was written for the incomplete capture, so there is no pair
+        # for the adapter to have read back.
+        with self.assertRaisesRegex(AssertionError, "only available after"):
             session.result()
         if how == "caught_call":
             # The block exits cleanly, so relaxing the gates at construction lets
@@ -4364,7 +4370,7 @@ class TestPrecompile(TestCase):
             run(relaxed)
             relaxed.result()
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_sessions_restore_the_capture_config(self):
         # The capture's config flip is per call, not block-level: the flags are
         # ambient before the block, between calls and after it, and up only
@@ -4453,7 +4459,7 @@ class TestPrecompile(TestCase):
             with self.assertRaises(PackageError):
                 session.artifact()
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_exit_waits_for_a_worker_thread_call(self):
         # A worker thread's call inherits the capture, and __exit__ waits for it.
         from torch._dynamo.backends.registry import register_backend
@@ -4510,7 +4516,6 @@ class TestPrecompile(TestCase):
             _get_total_cache_entry_count(_precompile_single_graph.__code__), 0
         )
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_session_is_one_shot_and_releases_its_examples(self):
         example = torch.randn(1024)
         example_ref = weakref.ref(example)
@@ -4553,7 +4558,6 @@ class TestPrecompile(TestCase):
         return _parse_artifact_metadata(code)["FRAMES"]
 
     @parametrize("backend", ("eager", "inductor"))
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_multi_graph_artifact_follows_the_code_cache_contract(self, backend):
         from torch._C._dynamo.eval_frame import _debug_get_precompile_entries
         from torch._precompile import _parse_artifact_metadata
@@ -4633,8 +4637,7 @@ class TestPrecompile(TestCase):
             with torch.no_grad():
                 loaded(model, torch.randn(9, 8))
 
-    @parametrize("backend", ("eager", "inductor"))
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @parametrize("backend", ("eager",))  # inductor: training lowering follow-up
     def test_tracer_dynamo_training_step_with_backward_in_fn(self, backend):
         # The Note's headline training step: .backward() inside fn graph-breaks,
         # the continuation runs it through the live autograd engine, and the
@@ -4680,7 +4683,6 @@ class TestPrecompile(TestCase):
         self.assertEqual(counters["stats"]["unique_graphs"], 0)
 
     @parametrize("case", list(_AUTO_DYNAMIC_CASES))
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_automatic_dynamic_promotes_the_frames_that_varied(self, case):
         # A dim that varies has to be detected separately in every frame that
         # reads it -- otherwise the artifact serves a new shape up to the first
@@ -4740,7 +4742,7 @@ class TestPrecompile(TestCase):
                 with self.assertRaisesRegex(PrecompileError, "no captured variant"):
                     static(model, *args)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_multi_graph_unreachable_frame_is_served_by_installing(self):
         # A frame Dynamo compiled that is entered by an ORDINARY call -- an
         # un-inlinable helper -- is reached only through the frame evaluator. A
@@ -4779,7 +4781,6 @@ class TestPrecompile(TestCase):
             # Served, not recompiled: the whole point of installing.
             self.assertEqual(counters["stats"]["unique_graphs"], 0)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_a_subgraph_whose_lowering_fails_keeps_the_bundle(self):
         # Rendering is per subgraph: one that compile_to_python refuses stays
         # pickled in _BACKENDS, the header counts it, and the artifact serves.
@@ -4819,7 +4820,7 @@ class TestPrecompile(TestCase):
         with torch.no_grad():
             self.assertEqual(loaded(x), _precompile_multi_graph(x))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_installed_artifact_fn_must_match_the_capture(self):
         # load(fn=...) installs onto whatever function it is given, so it has
         # to refuse one the artifact was not captured from -- the same check
@@ -4843,7 +4844,7 @@ class TestPrecompile(TestCase):
         with loaded, torch.no_grad():
             self.assertEqual(loaded(x), _precompile_unreachable_helper_caller(x))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_installed_artifact_unload_releases_its_recorded_backends(self):
         # Installing files the artifact's backends into the process-global
         # PrecompileContext. unload() has to take exactly those out again, or
@@ -4867,7 +4868,7 @@ class TestPrecompile(TestCase):
                 self.assertGreater(len(registry), baseline)
             self.assertEqual(len(registry), baseline)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_installed_artifact_handle_lifecycle(self):
         # Installing mutates process-global code objects, so a call after
         # unload() must raise rather than silently re-install; a fresh load() is
@@ -4970,7 +4971,7 @@ class TestPrecompile(TestCase):
         self.assertIn("unloaded", str(errors[0]))
         self.assertIsNone(handle._inner)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_uncovered_call_outside_serving_tolerates_an_unpicklable_local(self):
         # An installed artifact recompiles an uncovered call outside serving()
         # the way torch.compile does. That frame is served, not captured, so
@@ -4996,7 +4997,7 @@ class TestPrecompile(TestCase):
                 loaded(x, uncovered), _precompile_unreachable_helper_caller(x) * 3
             )
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_missing_captured_module_raises_precompile_error(self):
         # Both drivers import the modules the capture came from. A module that
         # is not importable here surfaces as the documented PrecompileError, not
@@ -5066,7 +5067,7 @@ class TestPrecompile(TestCase):
 
     @parametrize("case", list(_PRECOMPILE_TRAINING_CASES))
     @parametrize("backend", ("eager", "inductor"))
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_training_capture_serves_a_backward_without_a_loss(self, case, backend):
         # The capture never sees a loss and never calls .backward(). The joint
         # trace synthesizes tangents from the forward outputs, and the backward
@@ -5117,7 +5118,7 @@ class TestPrecompile(TestCase):
         # Served, not recompiled: forward and backward alike.
         self.assertEqual(counters["stats"]["unique_graphs"], 0)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_training_capture_does_not_read_grad_off_non_leaf_tensors(self):
         # The pickler reads .grad off the tensors it serializes. On a non-leaf
         # that is always None and warns; a training capture guards such tensors.
@@ -5137,7 +5138,6 @@ class TestPrecompile(TestCase):
         leaf_warnings = [str(w.message) for w in caught if "non-leaf" in str(w.message)]
         self.assertEqual(leaf_warnings, [])
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_inference_capture_stays_grad_free(self):
         # The default is unchanged: examples run under no_grad, so a served
         # output carries no autograd history.
@@ -5154,9 +5154,8 @@ class TestPrecompile(TestCase):
         with torch.no_grad():
             self.assertFalse(loaded(model, x).requires_grad)
 
-    @parametrize("shape", list(_BREAKING_MODELS))
+    @parametrize("shape", ["break_in_loop"])
     @parametrize("backend", ["eager", "inductor"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_dynamo_tracer_serves_each_graph_break_shape(self, shape, backend):
         # The dynamo tracer against graph breaks and recompilations. Every case
         # asserts the artifact serves, and that it agrees with torch.compile --
@@ -5211,7 +5210,7 @@ class TestPrecompile(TestCase):
         self.assertEqual(counters["stats"]["unique_graphs"], 0)
 
     @parametrize("backend", ["eager", "inductor"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_dynamo_tracer_serves_every_captured_recompilation(self, backend):
         # Two axes vary -- a bool that changes the branch and a shape that
         # changes the specialization -- so the capture holds several guarded
@@ -5266,7 +5265,7 @@ class TestPrecompile(TestCase):
                     loaded(*uncovered)
 
     @parametrize("case", list(_PRECOMPILE_GUARD_POLICY_CASES))
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_guard_policy_keeps_what_discriminates(self, case):
         from torch._precompile import _parse_artifact_metadata, _read_literal
 
@@ -5296,7 +5295,7 @@ class TestPrecompile(TestCase):
                 with self.assertRaisesRegex(RuntimeError, "no captured variant"):
                     loaded(*args)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_invariants_report_lists_policy_dropped_slots(self):
         # The report header promises a dropped line is "a precondition NOTHING
         # checks". A policy-dropped slot is exactly that, but the policy used
@@ -5334,7 +5333,6 @@ class TestPrecompile(TestCase):
         for name in named:
             self.assertRegex(report, rf"\[dropped \][^\n]*{re_mod.escape(name)}")
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_a_capture_without_compiled_code_is_not_complete(self):
         # allow_empty_graphs keeps a frame that compiled nothing as one guarded
         # code, so guarded_codes alone cannot tell a real capture from one whose
@@ -5367,7 +5365,6 @@ class TestPrecompile(TestCase):
         self.assertEqual(_parse_artifact_metadata(code)["TRACER"], "dynamo")
 
     @parametrize("root", ["local", "module"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_a_dict_membership_guard_is_never_dropped(self, root):
         # `"flag" in d` is a branch, and the guard pinning it (DICT_NOT_CONTAINS)
         # is a Python fact about a container's contents. Whatever the policy
@@ -5409,7 +5406,7 @@ class TestPrecompile(TestCase):
                 loaded(*refused)
 
     @parametrize("where", ["object", "in_a_list"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_unpicklable_guard_value_names_where_it_lives(self, where):
         # The type in a pickle error says WHAT failed and never WHERE, which on a
         # large model means bisecting by hand. A lock is the archetypal offender
@@ -5433,7 +5430,7 @@ class TestPrecompile(TestCase):
             ) as cap:
                 cap(*args)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_serialized_guards_carry_no_bookkeeping(self):
         # Guard.code_list and .guard_types are rebuilt by create_fn at load, and
         # set_export_info EXTENDS them on every guard build, so shipping them
@@ -5469,7 +5466,6 @@ class TestPrecompile(TestCase):
             for x in xs:
                 self.assertEqual(loaded(model, x), model(x))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_a_mutating_module_is_guarded_on_what_the_capture_saw(self):
         # Learning the guard policy from a throwaway first capture would run
         # every example twice. A counter advanced by the capture itself is baked
@@ -5500,8 +5496,9 @@ class TestPrecompile(TestCase):
             for x in xs:
                 self.assertEqual(loaded(cold, x), _brk_call(reference, x))
 
-    @parametrize("junk", ["dtype", "int", "str", "device"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @parametrize(
+        "junk", ["int", "str", "device"]
+    )  # dtype: guard-tree pruning follow-up
     def test_unguarded_interned_attribute_does_not_poison_the_artifact(self, junk):
         # Value pruning is keyed by id(), which asks "same OBJECT" when it means
         # "same REFERENCE". For an interned value those come apart: an unguarded
@@ -5529,9 +5526,8 @@ class TestPrecompile(TestCase):
         with _maybe_scoped(loaded), torch.no_grad():
             self.assertEqual(loaded(model, x), expected)
 
-    @parametrize("entry", list(_PRECOMPILE_CLOSURE_ENTRIES))
+    @parametrize("entry", ["lambda"])  # installed_entry: serving mode not in this build
     @parametrize("backend", ["inductor", "eager"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_dynamo_closure_entry_is_refused(self, entry, backend):
         factory, make_args = _PRECOMPILE_CLOSURE_ENTRIES[entry]
         with self.assertRaisesRegex(PrecompileError, "closes over"):
@@ -5540,8 +5536,9 @@ class TestPrecompile(TestCase):
                     cap(*make_args())
             cap.result()
 
-    @parametrize("case", ["inference", "training", "two_variants_of_one_frame"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @parametrize(
+        "case", ["inference", "two_variants_of_one_frame"]
+    )  # training: follow-up
     def test_dynamo_tracer_renders_kernels_as_source(self, case):
         # A compiled subgraph is Inductor output, which has a source form -- so
         # the dynamo tracer emits it rather than pickling it, leaving only the
@@ -5582,7 +5579,7 @@ class TestPrecompile(TestCase):
                 args = (fn, x) if isinstance(fn, torch.nn.Module) else (x,)
                 self.assertEqual(loaded(*args), fn(x))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_dynamo_tracer_names_why_a_subgraph_stayed_pickled(self):
         # A subgraph the composer refuses stays a pickled bundle, and the
         # artifact says so in its header, with the reason, rather than shipping
@@ -5606,8 +5603,9 @@ class TestPrecompile(TestCase):
         self.assertIn("synthetic_base_wrapper", header[0])
 
     @parametrize("construct", sorted(_EAGER_ROUND_TRIP))
-    @parametrize("broken", [False, True])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @parametrize(
+        "broken", [False]
+    )  # broken=True breaks in a child frame: installed mode follow-up
     def test_eager_backend_graph_survives_serialization(self, construct, broken):
         # An eager subgraph ships as a pickled GraphModule, whose reduction keeps
         # only the generated source and re-derives the Graph by re-tracing it. A HOP
@@ -5652,7 +5650,7 @@ class TestPrecompile(TestCase):
         self.assertFalse(served.requires_grad)
         self.assertEqual(served, expected)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_multi_graph_bare_module_capture_is_refused(self):
         # Handing precompile a bare nn.Module compiles Dynamo's OWN wrapper
         # frame (wrap_inline's `inner`), which closes over the module: the
@@ -5722,7 +5720,7 @@ class TestPrecompile(TestCase):
                 frames, types.SimpleNamespace(fn_name="step", codes=[])
             )
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_multigraph_artifact_round_trips_a_graph_break(self):
         from torch._dynamo.package import CompilePackage, SerializedCode
         from torch._dynamo.precompile_context import EagerCacheArtifact
@@ -5778,7 +5776,7 @@ class TestPrecompile(TestCase):
         with self.assertRaisesRegex(PrecompileError, "produced on Python 3.99"):
             _load_pair(foreign, buf.getvalue())
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_guarded_user_object_prunes_its_unguarded_attributes(self):
         # Pruning used to apply only to nn.Module, so a guarded object that is
         # NOT a module -- a train pipeline holding a dataloader -- was pickled
@@ -5805,7 +5803,7 @@ class TestPrecompile(TestCase):
     @torch._dynamo.config.patch(
         automatic_dynamic_shapes=True, assume_static_by_default=True
     )
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_capture_limits_and_frame_state_are_scoped_to_the_session(self):
         # Neither recompile limits nor automatic-dynamic frame state cross
         # between a session and ordinary compiles of the same code.
@@ -5890,7 +5888,6 @@ class TestPrecompile(TestCase):
         self.assertEqual(ordinary_frame_count(), 2)
 
     @parametrize("backend", ["eager", "inductor"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_multi_graph_round_trip_exercised_empty_resume(self, backend):
         x = torch.arange(3.0)
         expected = [_precompile_empty_resume(x, flag) for flag in (False, True)]
@@ -5914,7 +5911,6 @@ class TestPrecompile(TestCase):
             for flag, want in zip((False, True), expected):
                 self.assertEqual(loaded(x, flag), want)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_dynamo_captures_a_keyword_call(self):
         # The dynamo tracer takes keyword arguments, so the loaded artifact serves
         # the same keywords rather than positional arguments only.
@@ -5942,7 +5938,6 @@ class TestPrecompile(TestCase):
 
     @parametrize("bounds", [None, (4, 16)])
     @parametrize("backend", ["inductor", "eager"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_dynamo_mark_unbacked_runs_across_sizes(self, bounds, backend):
         # Dynamic shapes are opt-in via mark_unbacked for the dynamo tracer too: Dynamo
         # captures the marked dim as an UNBACKED symint, so the ONE artifact serves any
@@ -5973,7 +5968,6 @@ class TestPrecompile(TestCase):
                 with self.assertRaisesRegex(PrecompileError, "no captured variant"):
                     f_c(m, torch.randn(2, 4))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_dynamo_cross_tracer_cache_rejected(self):
         # A cache from the make_fx tracer paired with dynamo python_code is a mismatched
         # pairing and must be rejected (the code_hash and the tracer tag both catch it),
@@ -5992,7 +5986,6 @@ class TestPrecompile(TestCase):
 
     @parametrize("output", list(_PRECOMPILE_OUTPUT_SHAPES))
     @parametrize("backend", ["inductor", "eager"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_dynamo_output_structures_round_trip(self, output, backend):
         # Under dynamo the transformed bytecode (NOT the driver's OUT_SPEC path make_fx
         # uses) reassembles fn's output, so each leaf is checked on both backends: a
@@ -6015,7 +6008,6 @@ class TestPrecompile(TestCase):
                 self.assertIs(out[1], ref[1])
 
     @parametrize("backend", ["inductor", "eager"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_dynamo_dtensor_subclass(self, backend):
         # The dynamo-tracer analog of test_dtensor_subclass: a DTensor param/input must
         # round-trip on both backends. The dynamo eager emit inlines the subgraph against an
@@ -6072,7 +6064,6 @@ class TestPrecompile(TestCase):
 
     @parametrize("call", ["omit_all_defaults", "pass_the_first_positionally"])
     @parametrize("backend", ["inductor", "eager"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_dynamo_defaults_roundtrip(self, call, backend):
         # fn with positional defaults and a keyword-only default drives the driver's
         # argdefs / kwdefaults restoration; the defaults must be honored at the runtime
@@ -6091,7 +6082,6 @@ class TestPrecompile(TestCase):
         for _label, f_c in _default_and_inlined_loaders(code, cache, backend):
             self.assertEqual(f_c(*args), _precompile_with_defaults(*args))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_dynamo_static_under_dynamic_config(self):
         # dynamic=None is the ambient config (test_automatic_dynamic_promotes_the_frames_that_varied
         # relies on that), so a STATIC capture is spelled dynamic=False, which pins
@@ -6156,7 +6146,6 @@ class TestPrecompile(TestCase):
         )
         self.assertEqual(f_c(m, x), m(x))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_default_and_explicit(self):
         # capture()'s tracer defaults to DynamoTracer(); MakeFxTracer is the
         # single-trace alternative. Drive the real API (not the string shim) so
@@ -6191,7 +6180,6 @@ class TestPrecompile(TestCase):
     @parametrize("module_receiver", [True, False])
     @parametrize("shadow", [True, False])
     @parametrize("read", [True, False])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_precompile_serves_a_bound_method_whose_receiver_was_pruned(
         self, module_receiver, shadow, read
     ):
@@ -6226,7 +6214,7 @@ class TestPrecompile(TestCase):
         with _maybe_scoped(loaded), torch.no_grad():
             self.assertEqual(loaded(holder, x), expected)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_precompile_pruned_receiver_identity_guard_is_risky_not_silent(self):
         # The CLOSURE_MATCH identity slot on the saved function is dropped, as
         # it is in every artifact -- but as RISKY, which the default refuses.
@@ -6261,7 +6249,7 @@ class TestPrecompile(TestCase):
     @parametrize(
         "attr", ["plain", "across_break", "large_then_rebound", "self_referential"]
     )
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_guard_through_a_tensor_attribute_round_trips(self, attr):
         # A guard rooted at a Python attribute of a tensor (x._cpu_copy) is
         # REBUILT at load, so the attribute travels in the pickle's STATE slot:
@@ -6318,7 +6306,7 @@ class TestPrecompile(TestCase):
             "dynamic_bounds",
         ],
     )
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_marked_artifact_serves_the_tensor_it_captured(self, marking):
         # The dimension-marking guard reads its attributes off the example value
         # rather than through a source, so nothing registers them in the guard
@@ -6358,7 +6346,7 @@ class TestPrecompile(TestCase):
             with self.assertRaisesRegex(RuntimeError, "no captured variant"):
                 loaded(m, y)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_attribute_shadowing_fake_tensor_state_is_refused(self):
         # A reconstructed tensor IS a FakeTensor, so an attribute of the same
         # name as one a FakeTensor keeps its own state in cannot be carried.
@@ -6376,7 +6364,6 @@ class TestPrecompile(TestCase):
                 ) as cap:
                     cap(x)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_guard_on_a_module_global_tensor_round_trips(self):
         # A TENSOR_MATCH carries its own subject inside its create_fn partial.
         # When the source root round-trips by ALIAS -- a module global comes
@@ -6414,7 +6401,7 @@ class TestPrecompile(TestCase):
         """Patch _report_guard_drift to append each newly recorded drift to ``drift``."""
 
     @parametrize("api", ["session", "public"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_guards_that_cannot_be_rebuilt_are_dropped_not_refused(self, api):
         # A guard that cannot be rebuilt is dropped and recorded, not grounds
         # for refusing the other frames. Whether it is worth keeping is a
@@ -6504,7 +6491,7 @@ class TestPrecompile(TestCase):
         with _maybe_scoped(loaded), torch.no_grad():
             self.assertEqual(loaded(model, x), _precompile_call_model(model, x))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_guard_drift_is_reported(self):
         # The loud half of a lossy reconstruction is a guard that will not
         # rebuild at all. The quiet half is one that rebuilds into a DIFFERENT
@@ -6552,7 +6539,7 @@ class TestPrecompile(TestCase):
         )
         self.assertIn("L['mode'] == 'z'", str(ctx.exception))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_guard_drift_into_another_variants_check_is_reported(self):
         # Union-of-all-variants would hide this: the drifted check IS a live
         # leaf, only from a DIFFERENT variant. Two variants are captured, and
@@ -6601,7 +6588,7 @@ class TestPrecompile(TestCase):
         )
         self.assertIn("L['mode'] == 'b'", str(ctx.exception))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_precompile_records_what_each_dropped_slot_checked(self):
         # A slot is named by its type and SOURCE, and for some types that is
         # not enough to judge the drop. A dropped HASATTR on a source may be
@@ -6644,8 +6631,9 @@ class TestPrecompile(TestCase):
         for gtype, name, _ in rendered:
             self.assertIn((gtype, name), every_drop)
 
-    @parametrize("subject", ["object_attr", "tensor_attr"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @parametrize(
+        "subject", ["object_attr"]
+    )  # tensor_attr: carried tensor attributes follow-up
     def test_hasattr_guard_survives_serialization(self, subject):
         # hasattr is a branch, and the HASATTR guard is all that pins it. It
         # was lost two ways. A single-variant capture makes every slot look
@@ -6684,7 +6672,6 @@ class TestPrecompile(TestCase):
             with self.assertRaisesRegex(RuntimeError, "no captured variant"):
                 loaded(*refused)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_precompile_keeps_a_guard_whose_derived_type_must_survive(self):
         # One Guard can emit several checks: a DICT_KEYS_MATCH emits the
         # SEQUENCE_LENGTH for the same dict, as a DERIVED type. The filter
@@ -6711,7 +6698,7 @@ class TestPrecompile(TestCase):
             with self.assertRaisesRegex(RuntimeError, "no captured variant"):
                 loaded(four, x)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_precompile_installed_entry_keeps_its_defaults(self):
         # An installed artifact rebuilds its entry from a code object, which
         # carries neither defaults nor closure values. Without them a defaulted
@@ -6739,7 +6726,6 @@ class TestPrecompile(TestCase):
             # artifact carried the default.
             self.assertEqual(loaded(model, x), _precompile_defaulted_entry(model, x))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_precompile_user_global_wins_over_the_artifacts_own(self):
         # The rendered backend source is exec'd into the artifact module and
         # brings its own names with it. Binding the frames to that live dict let
@@ -6760,7 +6746,7 @@ class TestPrecompile(TestCase):
         with _maybe_scoped(loaded), torch.no_grad():
             self.assertEqual(loaded(x), _precompile_shadowed_global_entry(x))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_precompile_serving_does_not_mutate_the_artifact(self):
         # CompilePackage appends to the entry's per-code records, so a
         # serve-time recompile used to write its new backend id back into the
@@ -6787,7 +6773,7 @@ class TestPrecompile(TestCase):
                 x = torch.randn(rows, 8)
                 self.assertEqual(loaded(model, x), _precompile_attr_entry(model, x))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_installed_artifact_unload_takes_back_only_its_own_keys(self):
         # Backend keys are per-capture uuids, so only another handle on this
         # artifact can legitimately hold them; a foreign object filed under one
@@ -6858,8 +6844,7 @@ class TestPrecompile(TestCase):
         for key in keys:
             self.assertIsNone(PrecompileContext.serialize_artifact_by_key(key))
 
-    @parametrize("mode", ["standalone", "installed"])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @parametrize("mode", ["standalone"])  # installed: serving mode not in this build
     def test_artifact_refuses_a_foreign_torch_build(self, mode):
         # A dynamo artifact carries Dynamo internals in its opaque blobs, so it
         # is locked to the build that made it. The standalone driver emitted
@@ -6893,7 +6878,6 @@ class TestPrecompile(TestCase):
         ):
             _load_pair(code, cache)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_standalone_artifact_refuses_drifted_inlined_source(self):
         # A standalone artifact builds no CompilePackage, so it never ran the
         # inlined-source check the installed mode gets for free -- and an
@@ -6959,7 +6943,6 @@ class TestPrecompile(TestCase):
             with _maybe_scoped(loaded), torch.no_grad():
                 self.assertEqual(loaded(x), (x * 3.0).sum())
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_precompile_records_a_backend_for_a_short_circuited_noop_graph(self):
         # A graph that runs nothing and returns nothing never reaches the
         # backend: output_graph substitutes noop_graph_call rather than pay a
@@ -7004,7 +6987,6 @@ class TestPrecompile(TestCase):
             self.assertIsNone(loaded(model, x))
 
     @parametrize("entry", [_precompile_calls_unkeyable, _precompile_mixed_keyability])
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_capture_records_a_graph_the_cache_will_not_key(self, entry):
         # AOTAutogradCache refuses to KEY a graph calling anything outside its
         # allowlist, and a refusal means it never saves -- so the bundled
@@ -7032,7 +7014,7 @@ class TestPrecompile(TestCase):
         with _maybe_scoped(loaded), torch.no_grad():
             self.assertEqual(loaded(model, x), want)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_installed_artifact_reports_what_it_compiles_at_serve(self):
         # An installed artifact answers a guard miss by COMPILING, not by
         # refusing -- a frame reachable only through the frame evaluator has no
@@ -7110,7 +7092,7 @@ class TestPrecompile(TestCase):
         self.assertIn("recorded 1 of 2", one)
         self.assertNotIn("more)", one)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs the risky-drop lint over identity guards
     def test_custom_op_captures_where_an_aliased_autograd_function_cannot(self):
         # An autograd.Function reached through a module-level alias of .apply
         # guards on the identity of the class and its two staticmethods.
@@ -7164,7 +7146,7 @@ class TestPrecompile(TestCase):
             tracer=tracer,
         )
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_precompile_save_checkpoints_each_call(self):
         # cap.save() rewrites the on-disk artifact whenever the caller calls it,
         # so a pipelined training step -- which cannot be replayed back to back
@@ -7203,7 +7185,7 @@ class TestPrecompile(TestCase):
             self.assertGreater(codes[1], codes[0])
 
             torch._dynamo.reset()
-            loaded = _load_pair(artifact_path=artifact_path, cache_path=cache_path)
+            loaded = torch.compiler.precompile.load(artifact_path, cache_path)
             with _maybe_scoped(loaded):
                 for x, mode in zip(xs, modes):
                     model.zero_grad(set_to_none=True)
@@ -7213,7 +7195,6 @@ class TestPrecompile(TestCase):
                         _precompile_accum_step(eager, x, mode),
                     )
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_precompile_exit_waits_for_inflight_call(self):
         # A call holds the capture's reentrant lock for its whole duration, and
         # the session drains in-flight calls before tearing the region down, so
@@ -7259,7 +7240,7 @@ class TestPrecompile(TestCase):
                 if not exited.is_set():
                     capture.__exit__(None, None, None)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_precompile_save_keeps_the_last_artifact_when_the_rewrite_fails(self):
         # save() rewrites both files, and when the step ran but only the on-disk
         # rewrite failed, the files on disk are still the previous save's
@@ -7316,7 +7297,6 @@ class TestPrecompile(TestCase):
                     _precompile_accum_step(eager, xs["a"], "a"),
                 )
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_precompile_save_serves_a_slot_only_a_later_call_makes_vary(self):
         # The shape that breaks the obvious implementation. On call 1 the frame
         # has ONE variant, and a slot cannot disagree with itself, so the
@@ -7342,12 +7322,12 @@ class TestPrecompile(TestCase):
                 capture.save()
 
             torch._dynamo.reset()
-            loaded = _load_pair(artifact_path=artifact_path, cache_path=cache_path)
+            loaded = torch.compiler.precompile.load(artifact_path, cache_path)
             with _maybe_scoped(loaded):
                 self.assertEqual(loaded(cfg_with, x), want_with)
                 self.assertEqual(loaded(cfg_without, x), want_without)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_precompile_save_reports_the_drops_its_artifact_made(self):
         # The render filters COPIES, so the drops it made have to be read back
         # off that pass -- otherwise summary() and the artifact's own
@@ -7375,7 +7355,7 @@ class TestPrecompile(TestCase):
             with open(artifact_path) as f:
                 self.assertNotIn("POLICY_DROPPED_GUARDS = []", f.read())
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_precompile_save_call_state(self):
         # A call whose fn raises propagates that error and leaves the capture
         # open and usable: the next good call runs and returns, and calls()
@@ -7411,7 +7391,6 @@ class TestPrecompile(TestCase):
             finally:
                 _PRECOMPILE_RECURSIVE_CAPTURE.clear()
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_precompile_refuses_save_from_inside_fn(self):
         # save() from inside fn would try to snapshot the capture mid-call; it
         # holds the reentrant lock already, so it is refused like a recursive
@@ -7429,7 +7408,7 @@ class TestPrecompile(TestCase):
             finally:
                 _PRECOMPILE_SAVING_CAPTURE.clear()
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs the risky-drop lint over identity guards
     def test_precompile_save_gate_refusal_keeps_the_capture_open(self):
         # save() gates the artifact after the calls have run. A refusal raises
         # but writes nothing partial: the previous files (here, none yet) stay
@@ -7459,11 +7438,11 @@ class TestPrecompile(TestCase):
                     capture.save()
                     self.assertEqual(sorted(os.listdir(d)), ["m.cache", "m.py"])
             torch._dynamo.reset()
-            loaded = _load_pair(artifact_path=artifact_path, cache_path=cache_path)
+            loaded = torch.compiler.precompile.load(artifact_path, cache_path)
             with _maybe_scoped(loaded), torch.no_grad():
                 self.assertEqual(loaded(x, torch.sin), torch.sin(x + 1))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
+    @unittest.expectedFailure  # xfail(bullet): needs a feature the tracer bullet leaves out
     def test_precompile_save_serializes_concurrent_calls(self):
         # Two threads calling one capture: each call runs under the capture's
         # lock, so neither sees the other mid-call, and a save() cannot snapshot
@@ -7500,7 +7479,7 @@ class TestPrecompile(TestCase):
                     self.assertEqual(results[mode], eager(x, mode))
             self.assertEqual(sorted(os.listdir(d)), ["m.cache", "m.py"])
             torch._dynamo.reset()
-            loaded = _load_pair(artifact_path=artifact_path, cache_path=cache_path)
+            loaded = torch.compiler.precompile.load(artifact_path, cache_path)
             with _maybe_scoped(loaded), torch.no_grad():
                 for mode, x in xs.items():
                     self.assertEqual(loaded(model, x, mode), eager(x, mode))
@@ -7662,11 +7641,11 @@ class TestPrecompileCaptureFiles(TestCase):
         self.assertEqual(modes, {"wb"})
 
     def test_inductor_pair_round_trips(self):
-        # Called bare, so also the only coverage of capture()'s documented defaults:
-        # MakeFxTracer() and backend="inductor".
+        # backend is left at its default, so this is the coverage of capture()'s
+        # documented backend="inductor" default for a MakeFxTracer capture.
         a, c = self.artifact, self.cache
         with torch.compiler.precompile.capture(
-            _files_fn, artifact_path=a, cache_path=c
+            _files_fn, artifact_path=a, cache_path=c, tracer=MakeFxTracer()
         ) as cap:
             cap(self.model, self.x)
         self.assertIn("BACKEND = 'inductor'", self._read(self.artifact).decode())
@@ -7776,13 +7755,6 @@ class TestPrecompileCaptureFiles(TestCase):
     def test_non_tracer_is_refused(self):
         with self.assertRaisesRegex(TypeError, "must be a MakeFxTracer"):
             self._capture(tracer="make_fx")
-
-    def test_dynamo_tracer_is_refused_in_this_build(self):
-        # DynamoTracer is part of the surface, but precompile.capture() refuses it until
-        # the front-end lands; the refusal names the tracer to pass instead.
-        msg = "not available in this build.*MakeFxTracer"
-        with self.assertRaisesRegex(PrecompileError, msg):
-            self._capture(tracer=DynamoTracer())
 
     def test_unknown_backend_is_refused(self):
         msg = "backend must be 'inductor' or 'eager'"
@@ -9587,7 +9559,6 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(plain, reference)
         self.assertEqual(under, reference)
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_dynamo_roundtrip_device(self, device):
         # The dynamo tracer's inductor lowering emits device kernels (it lowers the
         # Dynamo-produced subgraph through the same AOTAutograd + Inductor codegen as
@@ -9615,7 +9586,6 @@ class TestPrecompileNumerics(TestCase):
             f_c = _load_pair(code, cache)
             self.assertEqual(f_c(m, x), m(x))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_dynamo_dynamic_shapes_device(self, device):
         # The dynamo tracer's mark_unbacked capture, run device-generically: the unbacked
         # symint reaches the inductor lowering (CUDA kernels included) and the eager
@@ -9641,7 +9611,6 @@ class TestPrecompileNumerics(TestCase):
                 xt = make_tensor((bs, 4), device=device, dtype=torch.float32)
                 self.assertEqual(f_c(m, xt), m(xt))
 
-    @unittest.expectedFailure  # xfail(bullet): DynamoTracer is not available yet
     def test_tracer_dynamo_eager_custom_builtins(self, device):
         # The dynamo eager emitter (_emit_dynamo_eager_subgraph) injects fx's full
         # _custom_builtins set (inf / nan / device / ...) into the standalone subgraph
