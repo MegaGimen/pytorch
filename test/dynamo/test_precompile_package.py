@@ -1,6 +1,10 @@
 # Owner(s): ["module: dynamo"]
 
 import builtins
+import collections
+import dataclasses
+import enum
+import functools
 import os
 import re
 import site
@@ -9,24 +13,38 @@ import sysconfig
 import tempfile
 import traceback
 import types
+import typing
 import zipfile
 from unittest import mock
 
 import torch
 import torch._dynamo.precompile_package as precompile_package
 import torch._inductor.test_case
+import torch.nn.functional as F
 import torch.utils._pytree as pytree
 from torch._dynamo.aot_compile import AOTCompiledFunction
 from torch._dynamo.exc import PackageError
 from torch._dynamo.guards import CheckFunctionManager, GuardBuilder, strip_local_scope
 from torch._dynamo.package import load_guards_state
-from torch._dynamo.source import get_global_source_name, GlobalSource
+from torch._dynamo.source import (
+    AttrSource,
+    DictGetItemSource,
+    get_global_source_name,
+    GetItemSource,
+    GlobalSource,
+    LocalSource,
+)
 from torch._dynamo.types import GuardFilterEntry
 from torch._guards import Guard
 
 
 def _user_op(x):
     return x + 1
+
+
+def _stack(*filenames):
+    """A guard's user_stack, outermost frame first."""
+    return traceback.StackSummary.from_list([(f, 1, "forward", "") for f in filenames])
 
 
 def _aot_compile(fn, *args, guard_filter_fn=None, seen=None):
@@ -62,6 +80,11 @@ def _pre_check_accepts(entry):
         entry.guard_type not in unsupported
         and not any(d in unsupported for d in entry.derived_guard_types)
     )
+
+
+_BUILTINS_DICT = GlobalSource("__builtins_dict___0")
+_HERE = _stack(__file__)
+_ELSEWHERE = _stack(F.__file__)
 
 
 def _entry(source, value, guard_type="ID_MATCH", derived=()):
@@ -664,6 +687,420 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         with mock.patch.object(precompile_package, "__file__", None):
             torch_roots.cache_clear()
             self.assertEqual(torch_roots(), ())  # frozen: no directory to anchor to
+
+    def test_reads_a_builtin_keys_on_where_the_read_comes_from(self):
+        reads_a_builtin = precompile_package._reads_a_builtin
+        self.assertTrue(reads_a_builtin(DictGetItemSource(_BUILTINS_DICT, "len"), len))
+        # A builtin parked in a slot, a user table keyed by a builtin's name and
+        # user code injected into builtins are all reads from a slot; the lint
+        # hands every dropped guard's source over unnarrowed, so the table read
+        # off a slot is refused rather than read as a global.
+        self.assertFalse(reads_a_builtin(AttrSource(LocalSource("self"), "act"), abs))
+        self.assertFalse(
+            reads_a_builtin(DictGetItemSource(GlobalSource("_OPS"), "len"), len)
+        )
+        table = DictGetItemSource(AttrSource(LocalSource("self"), "act_fns"), "len")
+        self.assertFalse(reads_a_builtin(table, len))
+        self.assertFalse(
+            reads_a_builtin(DictGetItemSource(_BUILTINS_DICT, "op"), _user_op)
+        )
+        # functools.wraps copies __module__ and __name__, so a shim installed as
+        # builtins.sum passes both; only a value CPython built is waived.
+        shim = functools.wraps(sum)(lambda *args: 0)
+        self.assertEqual((shim.__module__, shim.__name__), ("builtins", "sum"))
+        sum_read = DictGetItemSource(_BUILTINS_DICT, "sum")
+        self.assertFalse(reads_a_builtin(sum_read, shim))
+        self.assertTrue(reads_a_builtin(sum_read, sum))
+        self.assertTrue(reads_a_builtin(DictGetItemSource(_BUILTINS_DICT, "int"), int))
+
+        # Only under the builtin's own name (IOError is CPython's alias of
+        # OSError), only a value CPython built and only one builtins owns. The
+        # flag is what refuses a user class installed into builtins under its
+        # own name, whether its __module__ names the test module or, exec'd with
+        # the builtins namespace as its globals, claims "builtins" outright;
+        # among the real builtin types it costs the heap type ExceptionGroup
+        # alone (__loader__ is a heap type too, but its __name__ is not the
+        # key). The __module__ test is what refuses open, the one builtin
+        # function builtins does not own.
+        class UserError(Exception):
+            pass
+
+        io_read = DictGetItemSource(_BUILTINS_DICT, "IOError")
+        self.assertFalse(reads_a_builtin(io_read, IOError))
+        self.assertEqual((open.__module__, open.__name__), ("_io", "open"))
+        open_read = DictGetItemSource(_BUILTINS_DICT, "open")
+        self.assertFalse(reads_a_builtin(open_read, open))
+        loader = vars(builtins)["__loader__"]
+        self.assertNotEqual(getattr(loader, "__name__", None), "__loader__")
+        user_read = DictGetItemSource(_BUILTINS_DICT, "UserError")
+        self.assertFalse(reads_a_builtin(user_read, UserError))
+        ns = dict(vars(builtins))
+        exec("class unicode(str): pass", ns)
+        self.assertEqual(ns["unicode"].__module__, "builtins")
+        shim_read = DictGetItemSource(_BUILTINS_DICT, "unicode")
+        self.assertFalse(reads_a_builtin(shim_read, ns["unicode"]))
+        refused = [
+            name
+            for name, value in vars(builtins).items()
+            if isinstance(value, type)
+            and value.__name__ == name
+            and not reads_a_builtin(DictGetItemSource(_BUILTINS_DICT, name), value)
+        ]
+        heap_types = ["ExceptionGroup"] if sys.version_info >= (3, 11) else []
+        self.assertEqual(refused, heap_types)
+
+    def test_dynamo_synthesized_covers_only_the_resume_function_list(self):
+        synthesized = precompile_package._is_dynamo_synthesized
+        resume_fns = LocalSource("__nested_resume_fns")
+        self.assertTrue(synthesized(resume_fns))
+        self.assertTrue(synthesized(GetItemSource(resume_fns, 0)))
+        # The frame values are the live stack and locals of the frames nested
+        # inside the one resuming, so a guard rooted there is judged like the
+        # value it stands for.
+        self.assertFalse(
+            synthesized(GetItemSource(LocalSource("__nested_frame_values"), 0))
+        )
+        # A global spelled like one is a user binding.
+        self.assertFalse(synthesized(GlobalSource("__nested_resume_fns")))
+        self.assertFalse(synthesized(LocalSource("x")))
+
+    def test_alias_module_and_owning_module(self):
+        alias_module = precompile_package._dynamo_alias_module
+        self.assertIs(alias_module("__import_torch_dot_nn_dot_functional"), F)
+        # A user global is no alias even when its tail past the prefix length
+        # names a module; an unknown tail and a torch_package module, which
+        # import_source aliases without the prefix, come back None.
+        self.assertIsNone(alias_module("imported_torch"))
+        self.assertIsNone(alias_module("__import_not_a_module"))
+        self.assertIsNone(alias_module("_torch_package_0__dot_mypkg_dot_impl"))
+        owning_module = precompile_package._owning_module
+        self.assertEqual(owning_module(F), "torch.nn.functional")
+        self.assertEqual(owning_module(F.gelu), "torch._C._nn")
+        self.assertIsNone(owning_module(3))
+        self.assertIsNone(owning_module(types.SimpleNamespace(__module__=3)))
+
+    def test_defined_where_read_needs_the_name_and_the_file(self):
+        defined_where_read = precompile_package._defined_where_read
+        self.assertTrue(defined_where_read(_user_op, "_user_op", _HERE))
+        # Paths are compared normalized, so another spelling of the file matches.
+        unnormalized = os.path.join(
+            os.path.dirname(__file__), os.curdir, os.path.basename(__file__)
+        )
+        stack = _stack(unnormalized)
+        self.assertTrue(defined_where_read(_user_op, "_user_op", stack))
+        # A same-file def bound under another name is a slot, however near.
+        self.assertFalse(defined_where_read(_user_op, "act", _HERE))
+        self.assertFalse(defined_where_read(_user_op, "_user_op", _ELSEWHERE))
+        self.assertFalse(defined_where_read(_user_op, "_user_op", None))
+        self.assertFalse(defined_where_read(F.silu, "silu", _HERE))
+        self.assertFalse(defined_where_read(3, "3", _HERE))
+        # The guard carries the inlining stack at first use, so its innermost
+        # frame can be a helper from another file; the reading file is the root
+        # frame's, the one whose globals a bare GlobalSource denotes.
+        two_frame = _stack(__file__, F.__file__)
+        self.assertTrue(defined_where_read(_user_op, "_user_op", two_frame))
+        self.assertFalse(defined_where_read(F.silu, "silu", two_frame))
+
+        # A method extracted under its own name and a def returned by a factory
+        # are assignments, not a def under its own name: __qualname__ tells.
+        class Ops:
+            @staticmethod
+            def op(x):
+                return x
+
+        def availability_fork():
+            def _user_op(x):
+                return x + 2
+
+            return _user_op
+
+        self.assertFalse(defined_where_read(Ops.op, "op", _HERE))
+        self.assertFalse(defined_where_read(availability_fork(), "_user_op", _HERE))
+        # A module-level same-name fork inside this file binds a different def
+        # per machine under one checksum and cannot be told from the real one:
+        # the conditional-bind KNOWN GAP of _is_risky_drop, pinned as such.
+        forked = {}
+        exec(compile("def _user_op(x):\n    return x + 2\n", __file__, "exec"), forked)
+        self.assertTrue(defined_where_read(forked["_user_op"], "_user_op", _HERE))
+
+    def test_defined_where_read_takes_the_file_off_the_code_object(self):
+        defined_where_read = precompile_package._defined_where_read
+        # functools.wraps copies __module__ along with __name__ and __qualname__,
+        # so a wrapper minted in another file claims this one; its code object
+        # does not. A C-implemented wrapper has no code object and is not
+        # waived either, and neither is an unconditional cross-file decorator on
+        # a same-file def: the object does not tell it from the flag shape.
+        wrapped = torch.compile(_user_op, backend="eager")
+        self.assertEqual(
+            (wrapped.__name__, wrapped.__qualname__, wrapped.__module__),
+            ("_user_op", "_user_op", __name__),
+        )
+        self.assertFalse(defined_where_read(wrapped, "_user_op", _HERE))
+        cached = functools.lru_cache(_user_op)
+        self.assertFalse(hasattr(cached, "__code__"))
+        self.assertFalse(defined_where_read(cached, "_user_op", _HERE))
+        decorated = torch.no_grad()(_user_op)
+        self.assertFalse(defined_where_read(decorated, "_user_op", _HERE))
+        # A __code__ that is not a code object is refused, not read.
+        fake = types.SimpleNamespace(__qualname__="_user_op", __code__="not code")
+        self.assertFalse(defined_where_read(fake, "_user_op", _HERE))
+
+    def test_defined_where_read_refuses_a_pseudo_filename(self):
+        defined_where_read = precompile_package._defined_where_read
+
+        # A co_filename is not always a path: an exec-generated frame records
+        # <string>, which realpath would resolve against the cwd, so it would
+        # compare equal to the <string> a fields-only dataclass compiles
+        # __init__ in and waive the one class the lint must report. Only
+        # absolute filenames compare; a relative one, spelled so that it does
+        # resolve to this file from the cwd, and an embedded NUL on either side
+        # fail closed instead of raising.
+        @dataclasses.dataclass
+        class Cfg:
+            x: int
+
+        pseudo = _stack("<string>")
+        self.assertEqual(Cfg.__init__.__code__.co_filename, "<string>")
+        self.assertFalse(defined_where_read(Cfg, Cfg.__qualname__, pseudo))
+        exec_ns = {}
+        exec(compile("def op(x):\n    return x\n", "<string>", "exec"), exec_ns)
+        self.assertFalse(defined_where_read(exec_ns["op"], "op", pseudo))
+        relative = os.path.relpath(__file__)
+        self.assertTrue(os.path.samefile(relative, __file__))
+        stack = _stack(relative)
+        self.assertFalse(defined_where_read(_user_op, "_user_op", stack))
+        code = _user_op.__code__.replace(co_filename=relative)
+        relative_op = types.FunctionType(code, globals(), "_user_op")
+        self.assertFalse(defined_where_read(relative_op, "_user_op", _HERE))
+        stack = _stack(__file__ + "\x00")
+        self.assertFalse(defined_where_read(_user_op, "_user_op", stack))
+        code = _user_op.__code__.replace(co_filename=__file__ + "\x00")
+        nul_op = types.FunctionType(code, globals(), "_user_op")
+        self.assertFalse(defined_where_read(nul_op, "_user_op", _HERE))
+
+    def test_defined_where_read_judges_a_class_by_its_own_methods(self):
+        defined_where_read = precompile_package._defined_where_read
+        # A class has no code object; its methods tell. A class statement
+        # compiled its defs in this file under its own qualname prefix, and a
+        # class with no such def fails closed.
+        cls = type(self)
+        self.assertTrue(defined_where_read(cls, cls.__name__, _HERE))
+        self.assertFalse(defined_where_read(cls, cls.__name__, _ELSEWHERE))
+        self.assertFalse(defined_where_read(torch.nn.Linear, "Linear", _HERE))
+
+        # Ops and Cm, same-file class statements whose only def is a
+        # staticmethod or a classmethod (the __func__ arm), are waived, so is
+        # one whose only def is a property (the fget arm); a cached_property
+        # keeps its function under .func and is not unwrapped, so a class with
+        # nothing else fails closed, as does a class with no method of its own
+        # and one whose only methods are generated (a fields-only dataclass
+        # compiles __init__ and __eq__ in <string> and takes __repr__ from the
+        # stdlib, an Enum and a NamedTuple theirs from the stdlib or <string>).
+        # Members are unwrapped by type, never
+        # probed with getattr: a torch.classes proxy answers any attribute
+        # read by raising RuntimeError, and a class holding one is still judged.
+        class Ops:
+            @staticmethod
+            def op(x):
+                return x
+
+        class Cm:
+            @classmethod
+            def make(cls):
+                return cls()
+
+        class Prop:
+            @property
+            def x(self):
+                return 1
+
+        class Cached:
+            @functools.cached_property
+            def x(self):
+                return 1
+
+        class Marker:
+            pass
+
+        @dataclasses.dataclass
+        class Cfg:
+            x: int
+
+        class Color(enum.Enum):
+            RED = 1
+
+        class Pt(typing.NamedTuple):
+            x: int
+
+        # _Classes.__getattr__ installs the namespace it fabricates on the
+        # global torch.classes module; take it back off after the test.
+        self.addCleanup(delattr, torch.classes, "precompile_package_test")
+
+        class Model(torch.nn.Module):
+            ns = torch.classes.precompile_package_test
+
+            def forward(self, x):
+                return x
+
+        self.assertTrue(defined_where_read(Ops, Ops.__qualname__, _HERE))
+        self.assertTrue(defined_where_read(Cm, Cm.__qualname__, _HERE))
+        self.assertTrue(defined_where_read(Prop, Prop.__qualname__, _HERE))
+        self.assertFalse(defined_where_read(Cached, Cached.__qualname__, _HERE))
+        self.assertFalse(defined_where_read(Marker, Marker.__qualname__, _HERE))
+        self.assertFalse(defined_where_read(Cfg, Cfg.__qualname__, _HERE))
+        self.assertFalse(defined_where_read(Color, Color.__qualname__, _HERE))
+        self.assertFalse(defined_where_read(Pt, Pt.__qualname__, _HERE))
+        with self.assertRaises(RuntimeError):
+            Model.ns.__func__
+        self.assertTrue(defined_where_read(Model, Model.__qualname__, _HERE))
+        self.assertFalse(defined_where_read(Model, Model.__qualname__, _ELSEWHERE))
+
+    def test_defined_where_read_refuses_a_class_minted_for_the_file(self):
+        defined_where_read = precompile_package._defined_where_read
+        # namedtuple and type() (make_dataclass from 3.12) stamp __module__
+        # from the calling frame under a BARE __qualname__, so a class a
+        # library mints for this file claims it exactly like a class statement
+        # written here. None of its functions compiled under its qualname
+        # prefix, so it fails closed, including a factory fed a same-file def
+        # (bare qualname) and an imported class the reader attaches one to.
+        point = collections.namedtuple("Point", "x")
+        self.assertEqual((point.__module__, point.__qualname__), (__name__, "Point"))
+        self.assertFalse(defined_where_read(point, "Point", _HERE))
+        point = dataclasses.make_dataclass("Point", [("x", int)])
+        # 3.12+ stamps the caller's module on the class; 3.10/3.11 leave "types".
+        # Either way the bare qualname and library-compiled methods refuse it.
+        self.assertEqual(point.__qualname__, "Point")
+        self.assertFalse(defined_where_read(point, "Point", _HERE))
+        self.assertFalse(defined_where_read(type("Point", (), {}), "Point", _HERE))
+        point = type("Point", (), {"area": _user_op})
+        self.assertFalse(defined_where_read(point, "Point", _HERE))
+        # Under its own name as the key too: the qualname is _user_op, not
+        # Point._user_op, so the class half of the rule is what refuses it.
+        point = type("Point", (), {"_user_op": _user_op})
+        self.assertFalse(defined_where_read(point, "Point", _HERE))
+
+        # The key half: a same-file class statement's method carries its
+        # Named. prefix, so handed to a type() class of the same qualname it
+        # waives that class under its own key and not borrowed under another.
+        class Named:
+            def m(self):
+                return 0
+
+        def under(key):
+            qn = Named.__qualname__
+            return type("Named", (), {key: Named.m, "__qualname__": qn})
+
+        self.assertTrue(defined_where_read(under("m"), Named.__qualname__, _HERE))
+        self.assertFalse(defined_where_read(under("other"), Named.__qualname__, _HERE))
+        # A class imported from another file is not written here however many
+        # same-file functions the reader attaches to it.
+        imported = {"__name__": "mypkg.impl"}
+        source = "class Point:\n    def norm(self):\n        return 0\n"
+        exec(compile(source, F.__file__, "exec"), imported)
+        imported["Point"].extra = _user_op
+        self.assertFalse(defined_where_read(imported["Point"], "Point", _HERE))
+
+    def test_defined_where_read_skips_the_compiler_annotate_function(self):
+        defined_where_read = precompile_package._defined_where_read
+
+        # On 3.14 the compiler stores the PEP 649 annotate function of an
+        # annotated class body in its __dict__, compiled in this file, under
+        # key __annotate_func__ with qualname Cfg.__annotate__; the key rule
+        # refuses it, so a fields-only dataclass is reported on every version.
+        @dataclasses.dataclass
+        class Cfg:
+            x: int
+
+        if sys.version_info >= (3, 14):
+            annotate = vars(Cfg)["__annotate_func__"]
+            self.assertEqual(
+                (annotate.__qualname__, annotate.__code__.co_filename),
+                (f"{Cfg.__qualname__}.__annotate__", __file__),
+            )
+        self.assertFalse(defined_where_read(Cfg, Cfg.__qualname__, _HERE))
+
+        # Replayed on every version with a type() class handed a same-file
+        # function under that key and qualname. The control row, the same
+        # function under an ordinary key, shows the replay is what a class
+        # statement produces; the skip of both keys, against a version that
+        # stores the function under its own name, is pinned last.
+        def minted(key, qualname):
+            fn = types.FunctionType(_user_op.__code__, globals(), "__annotate__")
+            fn.__qualname__ = qualname
+            return type("Cfg", (), {key: fn})
+
+        self.assertTrue(defined_where_read(minted("op", "Cfg.op"), "Cfg", _HERE))
+        real = minted("__annotate_func__", "Cfg.__annotate__")
+        self.assertFalse(defined_where_read(real, "Cfg", _HERE))
+        for key in ("__annotate__", "__annotate_func__"):
+            own_key = minted(key, f"Cfg.{key}")
+            self.assertFalse(defined_where_read(own_key, "Cfg", _HERE), key)
+
+    @torch._dynamo.config.patch(nested_graph_breaks=True)
+    def test_minted_global_names_match_dynamo(self):
+        # The predicates lean on names Dynamo mints inline (the two prefixes
+        # through aot_compile.py), in install_builtins_dict_in_fglobals,
+        # import_source and the nested resume prologue; a rename there must
+        # fail here rather than silently turn the lint off.
+        seen = []
+
+        def record(entries):
+            seen.extend(entries)
+            return [True] * len(entries)
+
+        def roots():
+            return {
+                precompile_package._source_root(e.orig_guard.originating_source)
+                for e in seen
+            }
+
+        lin = torch.nn.Linear(2, 2)
+
+        def fn(x):
+            return lin(x) + len(x.shape)
+
+        compiled = torch.compile(
+            fn, backend="eager", options={"guard_filter_fn": record}
+        )
+        compiled(torch.ones(2))
+        reads_a_builtin = precompile_package._reads_a_builtin
+        self.assertTrue(
+            any(reads_a_builtin(e.orig_guard.originating_source, e.value) for e in seen)
+        )
+        aliases = {
+            r.global_name
+            for r in roots()
+            if isinstance(r, GlobalSource) and r.global_name.startswith("__import_")
+        }
+        alias = "__import_torch_dot_nn_dot_modules_dot_linear"
+        self.assertIn(alias, aliases)
+        self.assertIs(
+            precompile_package._dynamo_alias_module(alias), torch.nn.modules.linear
+        )
+
+        def callee(y):
+            torch._dynamo.graph_break()
+            return y + 1
+
+        def nested(x):
+            z = x * 2
+            return callee(z) + z
+
+        seen.clear()
+        # nested_graph_breaks is off by default; the patch above turns it on.
+        compiled = torch.compile(
+            nested, backend="eager", options={"guard_filter_fn": record}
+        )
+        compiled(torch.ones(2))
+        synthesized = {
+            r.local_name: precompile_package._is_dynamo_synthesized(r)
+            for r in roots()
+            if isinstance(r, LocalSource) and r.local_name.startswith("__nested")
+        }
+        # The resume function list is always passed; whether the frame values
+        # are guarded depends on which locals stay live across the break.
+        self.assertTrue(synthesized["__nested_resume_fns"])
+        self.assertFalse(synthesized.get("__nested_frame_values", False))
 
 
 if __name__ == "__main__":
