@@ -58,6 +58,7 @@ echo "[gdn] compiling gated_delta_ext (CPU/nvcc, no GPU occupancy)"
 ) || echo "[gdn] CUDA extension build failed; smoke will use Python GDN"
 
 echo "[gdn] nvidia-smi before smoke"
+unset CUDA_VISIBLE_DEVICES
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader || true
 
 echo "[gdn] launching 2-GPU FSDP+CP smoke, ${MEM_CAP_MIB} MiB/GPU cap"
