@@ -2964,6 +2964,257 @@ class TestPrecompileCaptureFiles(TestCase):
         with self.assertRaisesRegex(ValueError, "backend must be"):
             self._capture(backend="nope")
 
+    def test_served_output_ignores_ambient_autocast(self):
+        # eager only: this model lowers to extern_kernels.addmm(..., out=buf0), whose
+        # out= overload has no CPU autocast registration, so the inductor artifact
+        # cannot observe the ambient state (the extern-kernel test below covers it).
+        with self._capture(backend="eager") as cap:
+            y = cap(self.model, self.x)
+        served = load(self.artifact, self.cache)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            self.assertEqual(self.model(self.x).dtype, torch.bfloat16)
+            z = served(self.model, self.x)
+        self.assertEqual(z.dtype, torch.float32)
+        self.assertEqual(z, y)
+
+    @unittest.skipUnless(
+        torch.backends.mkldnn.is_available(), "the LSTM lowers to mkldnn_rnn_layer"
+    )
+    def test_served_extern_kernel_ignores_ambient_autocast(self):
+        # nn.LSTM lowers to aten.mkldnn_rnn_layer.default, which IS registered for
+        # CPU autocast and which the inductor artifact calls as a fallback: without
+        # _autocast_off the served call casts a second time and comes back in
+        # bfloat16 (or, as here, fails inside oneDNN on the mixed-dtype primitive).
+        # Inductor only: the eager driver has no extern kernels, so on that backend
+        # this is test_served_output_ignores_ambient_autocast with a bigger graph.
+        model = torch.nn.LSTM(8, 8, batch_first=True)
+        x = torch.randn(2, 3, 8)
+
+        def fn(m, t):
+            return m(t)[0]
+
+        with self._capture(fn, backend="inductor") as cap:
+            y = cap(model, x)
+        # The premise, not just the outcome: without this kernel in the artifact the
+        # assertion below holds whether or not the neutralization is there.
+        self.assertIn("mkldnn_rnn_layer", self._read(self.artifact).decode())
+        served = load(self.artifact, self.cache)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            z = served(model, x)
+        self.assertEqual(z.dtype, torch.float32)
+        self.assertEqual(z, y)
+
+    def test_capturing_under_autocast_bakes_the_casts_in(self):
+        # The remedy the docstrings prescribe for wanting autocast dtypes out of a
+        # served call: what the capture ran under is what the artifact replays, so a
+        # capture made inside a region serves those dtypes outside every region.
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            with self._capture() as cap:
+                y = cap(self.model, self.x)
+        self.assertEqual(y.dtype, torch.bfloat16)
+        served = load(self.artifact, self.cache)
+        self.assertEqual(served(self.model, self.x).dtype, torch.bfloat16)
+        # ...and a region with a DIFFERENT dtype does not re-cast what is baked in: the
+        # only coverage of a bf16-baked artifact served inside an fp16 region, where a
+        # second cast would silently DOWNGRADE precision rather than upgrade it.
+        with torch.autocast("cpu", dtype=torch.float16):
+            self.assertEqual(served(self.model, self.x).dtype, torch.bfloat16)
+
+    def test_a_served_call_enters_no_autocast_when_none_is_on(self):
+        # The disable is entered only where there is something to disable: with no
+        # ambient autocast a served call must not enter one per supported device at all.
+        with self._capture() as cap:
+            cap(self.model, self.x)
+        served = load(self.artifact, self.cache)
+        real_autocast = torch.amp.autocast
+        constructed = []
+
+        def autocast(device_type, **kwargs):
+            constructed.append(device_type)
+            return real_autocast(device_type, **kwargs)
+
+        with mock.patch("torch.amp.autocast", autocast):
+            served(self.model, self.x)
+            self.assertEqual(constructed, [])
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                served(self.model, self.x)
+        self.assertEqual(constructed, ["cpu"])
+
+    def test_a_device_the_captured_graph_never_names_is_neutralized_too(self):
+        # The device list is the SERVING build's, not the captured graph's, so a device
+        # an op reaches only inside its own body is covered as well. Stood in for here
+        # with a second supported device whose autocast bit is on: this graph is
+        # entirely cpu and the disable is still entered for that device. A per-artifact
+        # device tag scanned off the graph cannot do this.
+        self.addCleanup(torch.set_autocast_enabled, "mtia", False)
+        torch.set_autocast_enabled("mtia", True)
+        with self._capture() as cap:
+            cap(self.model, self.x)
+        served = load(self.artifact, self.cache)
+        real_autocast = torch.amp.autocast
+        constructed = []
+
+        def autocast(device_type, **kwargs):
+            constructed.append(device_type)
+            return real_autocast(device_type, **kwargs)
+
+        # The premise: nothing in the artifact names the second device.
+        self.assertNotIn("mtia", self._read(self.artifact).decode())
+        with mock.patch(
+            "torch._C._autocast_supported_devices", return_value=("cpu", "mtia")
+        ):
+            with mock.patch("torch.amp.autocast", autocast):
+                served(self.model, self.x)
+        self.assertEqual(constructed, ["mtia"])
+
+    def test_a_supported_device_this_build_has_no_module_for_is_ignored(self):
+        # hasattr(torch, dev) -- the guard graph_capture_wrappers.disable_autocast uses
+        # -- filters a device the autocast list advertises but this build has no module
+        # for, before anything can raise on it: the probe rejects an unparsable device
+        # type with a RuntimeError that _autocast_off deliberately does not catch.
+        with self._capture() as cap:
+            y = cap(self.model, self.x)
+        served = load(self.artifact, self.cache)
+        with mock.patch(
+            "torch._C._autocast_supported_devices", return_value=("cpu", "notadevice")
+        ):
+            with self.assertNoLogs("torch._precompile_driver", "WARNING"):
+                self.assertEqual(served(self.model, self.x), y)
+
+    def test_a_device_that_refuses_the_disable_is_a_reported_skip(self):
+        # The one skip that costs something: the device passes the hasattr guard,
+        # REPORTS autocast enabled, and torch.amp.autocast then refuses to construct
+        # the disable -- what a module registered under the privateuse1 backend name and
+        # missing get_amp_supported_dtype does, raising AssertionError out of the
+        # constructor. That name is the only device whose module the constructor
+        # consults, which is why the refusal is mocked here rather than real (a real
+        # mtia without autocast support constructs fine). The served call goes through
+        # and the skip is announced instead, through logging rather than warnings so
+        # that an error filter cannot fail the very call the skip keeps alive; the
+        # device's own region is left casting, which is the divergence the report is
+        # for, and the caller's cpu region is untouched.
+        self.addCleanup(torch.set_autocast_enabled, "mtia", False)
+        torch.set_autocast_enabled("mtia", True)
+        real_autocast = torch.amp.autocast
+
+        def autocast(device_type, **kwargs):
+            if device_type == "mtia":
+                raise AssertionError("Tried to use AMP with the `mtia` backend")
+            return real_autocast(device_type, **kwargs)
+
+        with self._capture() as cap:
+            y = cap(self.model, self.x)
+        served = load(self.artifact, self.cache)
+        with mock.patch("torch.amp.autocast", autocast):
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error")
+                    with self.assertLogs("torch._precompile_driver", "WARNING") as logs:
+                        z = served(self.model, self.x)
+                    self.assertIn("cannot construct the disable", "".join(logs.output))
+                    # Not once per served call.
+                    with self.assertNoLogs("torch._precompile_driver", "WARNING"):
+                        self.assertEqual(served(self.model, self.x), z)
+                # ...and not once per PROCESS either: the report-once set is emitted
+                # into the artifact, so a second load of the same pair reports again.
+                with self.assertLogs("torch._precompile_driver", "WARNING"):
+                    load(self.artifact, self.cache)(self.model, self.x)
+                self.assertTrue(torch.is_autocast_enabled("mtia"))
+                self.assertEqual(self.model(self.x).dtype, torch.bfloat16)
+        self.assertEqual(z.dtype, torch.float32)
+        self.assertEqual(z, y)
+
+    def test_an_autocast_that_refuses_to_enter_is_not_a_skip(self):
+        # Only the probe and the constructor are inside the catch. ExitStack registers
+        # its unwind only AFTER __enter__ returns, so an __enter__ that raises partway
+        # has left state nothing can undo: swallowing it as a skip would return with
+        # the caller's own region switched off, the opposite of what the skip reports.
+        # It propagates instead, and the disables already entered come back out.
+        #
+        # And the earlier device here is one that refuses to CONSTRUCT, so this also
+        # pins the report-once bookkeeping: the propagating __enter__ means the warning
+        # is never emitted, so that skip must not be left recorded as reported -- doing
+        # so would silence it for the rest of this loaded artifact's life.
+        from torch import _precompile_driver
+
+        real_autocast = torch.amp.autocast
+
+        class _RefusesToEnter:
+            def __enter__(self):
+                raise AssertionError("refused inside __enter__")
+
+            def __exit__(self, *exc):
+                return False
+
+        def autocast(device_type, **kwargs):
+            if device_type == "cpu":
+                return real_autocast(device_type, **kwargs)
+            if device_type == "xpu":
+                raise AssertionError("Tried to use AMP with the `xpu` backend")
+            return _RefusesToEnter()
+
+        reported: set[str] = set()
+        with mock.patch.object(
+            _precompile_driver, "_AUTOCAST_SKIPS_REPORTED", reported
+        ):
+            with torch.autocast("cpu", dtype=torch.bfloat16):
+                with mock.patch(
+                    "torch._C._autocast_supported_devices",
+                    return_value=("cpu", "xpu", "mtia"),
+                ):
+                    with mock.patch("torch.is_autocast_enabled", return_value=True):
+                        with mock.patch("torch.amp.autocast", autocast):
+                            with self.assertNoLogs(
+                                "torch._precompile_driver", "WARNING"
+                            ):
+                                with self.assertRaises(AssertionError):
+                                    _precompile_driver._autocast_off()
+                self.assertEqual(self.model(self.x).dtype, torch.bfloat16)
+        self.assertEqual(reported, set())
+
+    def test_autocast_off_unwinds_a_failure_partway_through(self):
+        # The disables already entered have to come back out if the stack is not
+        # built to the end: the emitted driver hands the stack to the caller's
+        # `with`, so a leaked entry silently stops the caller autocasting.
+        from torch import _precompile_driver
+
+        real_autocast = torch.amp.autocast
+        constructed = []
+
+        def autocast(device_type, **kwargs):
+            constructed.append(device_type)
+            if len(constructed) == 2:
+                raise KeyboardInterrupt("interrupted partway through")
+            return real_autocast(device_type, **kwargs)
+
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            # Every supported device has to report autocast on, or the disable this
+            # asks to be unwound is never entered: the loop skips a device with
+            # nothing on.
+            with mock.patch("torch.is_autocast_enabled", return_value=True):
+                with mock.patch("torch.amp.autocast", autocast):
+                    with self.assertRaises(KeyboardInterrupt):
+                        _precompile_driver._autocast_off()
+            self.assertEqual(self.model(self.x).dtype, torch.bfloat16)
+
+    @parametrize("backend", ("eager", "inductor"))
+    @unittest.skipUnless(TEST_CUDA, "CUDA has its own autocast policy and dtype")
+    def test_served_output_ignores_ambient_cuda_autocast(self, backend):
+        # Autocast is per device -- CUDA picks float16 and has its own op allowlist --
+        # so the neutralization is covered there too, on both drivers. The graph's
+        # aten.addmm.default IS registered for CUDA autocast, so without it the
+        # served call would come back in float16.
+        model = _FilesModel().cuda()
+        x = torch.randn(2, 4, device="cuda")
+        with self._capture(backend=backend) as cap:
+            y = cap(model, x)
+        served = load(self.artifact, self.cache)
+        with torch.autocast("cuda", dtype=torch.float16):
+            self.assertEqual(model(x).dtype, torch.float16)
+            z = served(model, x)
+        self.assertEqual(z.dtype, torch.float32)
+        self.assertEqual(z, y)
+
     @parametrize("backend", ("eager", "inductor"))
     def test_batchnorm_running_stats_update_once(self, backend):
         bn = torch.nn.BatchNorm1d(4)
