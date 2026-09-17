@@ -24,6 +24,7 @@ distinct from ``torch._dynamo.config.caching_precompile``, which caches
 from __future__ import annotations
 
 import functools
+import importlib.machinery
 import os
 import site
 import sys
@@ -234,6 +235,118 @@ def _torch_roots() -> tuple[str, ...]:
 def _within(path: str, roots: tuple[str, ...]) -> bool:
     """Prefix test over ``_norm``-ed paths; the caller normalizes both sides."""
     return any(path == r or path.startswith(r + os.sep) for r in roots)
+
+
+# Belt and braces for an install directory none of the roots name: whichever
+# layout put it there, a pip target still ends in one of these. Matched below
+# the stdlib root a file was found under, not on the whole path, so a stdlib
+# that itself sits under a site-packages directory keeps its waiver.
+_INSTALL_DIR_NAMES = frozenset({"site-packages", "dist-packages"})
+
+
+@functools.cache
+def _classify_file(file: str, stdlib: bool) -> bool | None:
+    """
+    Shipped here (True), shipped elsewhere (False), or no evidence (None), for
+    one ``__file__`` judged against the torch roots (``stdlib=False``) or the
+    stdlib roots minus the install roots (``stdlib=True``). None is only ever
+    a path that cannot be resolved; past those gates the torch arm never
+    answers None: with no torch root (a frozen torch) every path is elsewhere,
+    and ``_is_library_module`` waives torch names before asking. Cached on the
+    (file, flag) pair rather than on a module name: the roots are fixed for the
+    process, so the answer for a path never changes, while the module a name
+    resolves to can.
+    """
+    # Before 3.13 ntpath.isabs accepts a driveless \Lib\x.py (its LEGACY BUG
+    # comment), which realpath then resolves against the current drive.
+    driveless = sys.platform == "win32" and not os.path.splitdrive(file)[0]
+    if driveless or not os.path.isabs(file):
+        # Resolving it would be against a cwd that is not the one it was
+        # recorded under, so it is evidence in neither direction.
+        return None
+    if "\x00" in file:
+        # No file has one. posixpath.realpath raises ValueError on it from lstat;
+        # from gh-106242 on, ntpath.realpath swallows that and returns the path
+        # unresolved, whose prefix _within would then match.
+        return None
+    path = _norm(file)
+    if not stdlib:
+        return _within(path, _torch_roots())
+    if _within(path, _install_roots()):
+        return False
+    # The roots are sorted, so the first match is the outermost and the part
+    # below it the longest: the strictest reading of _INSTALL_DIR_NAMES. Case
+    # folded because normcase is the identity on posix, and a macOS filesystem
+    # is case-insensitive.
+    for root in _stdlib_roots():
+        if _within(path, (root,)):
+            below = path[len(root) + 1 :].lower().split(os.sep)
+            return _INSTALL_DIR_NAMES.isdisjoint(below)
+    return False
+
+
+def _located(module: object, name: str, stdlib: bool) -> bool | None:
+    """
+    Shipped here (True), shipped elsewhere (False), or no evidence (None), for
+    a sys.modules entry, which need not be a module. A ``__file__`` that
+    ``_classify_file`` can place decides, and only then is the loader read:
+    with importlib on disk, importlib/__init__.py gives importlib._bootstrap a
+    stdlib ``__file__`` next to a FrozenImporter whose table knows it only as
+    _frozen_importlib (with importlib frozen too it has no ``__file__``, and
+    the loader arm answers False under the dotted name: a lost waiver, not a
+    wrong drop). The built-in and frozen arms answer on the caller's ``name``
+    alone, not the module's ``__name__``, under either ``stdlib``: both importers
+    precede the path finder, so no sys.path entry can shadow such a module,
+    and its code is fixed by the interpreter binary, which is what either
+    waiver needs. The ``stdlib=False`` case is an embedding that registers
+    torch._C through PyImport_AppendInittab while torch's Python files stay on
+    disk, so ``_torch_roots`` is non-empty and ``_is_library_module`` does not
+    waive torch on its name.
+    """
+    # The module dict rather than getattr: a class attribute says nothing about
+    # where the module came from (torch.ops is a ModuleType subclass carrying
+    # the class's relative "_ops.py" as its __file__), and on an entry whose
+    # dict is missing one of these dunders getattr would fall through to a PEP
+    # 562 module __getattr__, user code a lint must not run (a raise is caught
+    # below, its side effects are not). And object's read of the dict, not the
+    # module's: importlib.util.LazyLoader leaves a _LazyModule whose
+    # __getattribute__ executes the module body on ANY attribute read, __dict__
+    # included, while its dict already carries the seeded __file__, __spec__ and
+    # __loader__. That read defeats a __getattr__ or a __getattribute__
+    # override, not a __dict__ descriptor defined on the type. sys.modules can
+    # hold any object, so that read on a slotted proxy, and spec.loader on a
+    # hand-rolled spec, are user code, and are caught.
+    try:
+        attrs = object.__getattribute__(module, "__dict__")
+        file = attrs.get("__file__")
+        # Only a str is classifiable: a bytes or PathLike __file__ would pass
+        # isabs and raise from the NUL check instead.
+        if isinstance(file, str):
+            verdict = _classify_file(file, stdlib)
+            if verdict is not None:
+                return verdict
+        # The loader rather than spec.origin: both importers' find_spec pass
+        # origin=cls._ORIGIN to spec_from_loader, so the two never disagree,
+        # and the class is the stronger signal. A truthy __loader__ skips the
+        # spec's loader, the only user-code half of this; ModuleType seeds
+        # __loader__ = None, so an ordinary module falls through to it.
+        spec = attrs.get("__spec__")
+        loader = attrs.get("__loader__") or getattr(spec, "loader", None)
+    except Exception:
+        return None
+    # Both arms compare by identity: under == a __loader__ whose __eq__ answers
+    # true for anything would take the waiver, and one whose __eq__ raises would
+    # escape this function, the catch being closed above.
+    if loader is importlib.machinery.BuiltinImporter:
+        # Statically linked, and BuiltinImporter precedes PathFinder on
+        # sys.meta_path, so on import no file on sys.path is reachable under
+        # this name; a spec assigned straight into sys.modules is taken at its
+        # word. The inittab is keyed on the full dotted name.
+        return name in sys.builtin_module_names
+    if loader is importlib.machinery.FrozenImporter:
+        # frozen also precedes the path finder
+        return importlib.machinery.FrozenImporter.find_spec(name) is not None
+    return None  # namespace package, or exec'd in memory with no loader
 
 
 def _defined_where_read(
