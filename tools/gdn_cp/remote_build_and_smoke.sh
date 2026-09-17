@@ -8,6 +8,12 @@ SRC="${ROOT}/pytorch"
 VENV="${ROOT}/.venv"
 MEM_CAP_MIB="${MEM_CAP_MIB:-500}"
 export MEM_CAP_MIB
+export PATH="/root/miniconda3/bin:/usr/local/cuda/bin:${PATH:-/usr/bin}"
+if [[ -f /etc/network_turbo ]]; then
+  # AutoDL helper: faster outbound to PyPI / download.pytorch.org
+  # shellcheck disable=SC1091
+  source /etc/network_turbo || true
+fi
 
 mkdir -p "${ROOT}"
 cd "${ROOT}"
